@@ -93,6 +93,11 @@ def test_incomplete_stage_is_not_resume_evidence(tmp_path: Path):
 
 def _pissa_resource_report(*, scope: str, swap_growth_kib: int) -> dict[str, object]:
     minimum = workflow.PISSA_MIN_MEM_AVAILABLE_KIB
+    host = {
+        "mem_available_kib": minimum + 1024,
+        "gpus": ({"index": 0},),
+        "compute_processes": (),
+    }
     return {
         "policy": workflow.PISSA_RESOURCE_POLICY,
         "scope": scope,
@@ -100,8 +105,8 @@ def _pissa_resource_report(*, scope: str, swap_growth_kib: int) -> dict[str, obj
         "swap_growth_is_diagnostic": True,
         "other_gpu_phases_max_swap_growth_kib": 256 * 1024,
         "observed_swap_growth_kib": swap_growth_kib,
-        "host_before": {"mem_available_kib": minimum + 1024},
-        "host_after": {"mem_available_kib": minimum},
+        "host_before": host,
+        "host_after": {**host, "mem_available_kib": minimum},
     }
 
 
@@ -145,6 +150,7 @@ def test_prepare_pissa_hashes_once_and_rechecks_a_resumed_stage(tmp_path: Path, 
     assert second == first
     assert first["observed_swap_growth_kib"] == 1024
     assert first["preparation_resources"]["scope"] == "full_serialization"
+    assert first["preparation_resources"]["host_before"]["gpus"] == [{"index": 0}]
 
 
 def test_prepare_pissa_never_defaults_missing_resource_evidence(tmp_path: Path, monkeypatch):

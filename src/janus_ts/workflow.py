@@ -645,7 +645,13 @@ def _pissa_resource_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
         or not isinstance(resources.get("host_after"), Mapping)
     ):
         raise WorkflowError("PiSSA preparation resource evidence violates the frozen policy")
-    return dict(resources)
+    # HostStatus.to_dict() intentionally preserves its tuple fields. Durable
+    # JSON turns those tuples into arrays, so normalize before immutable stage
+    # comparison instead of comparing Python container implementation details.
+    normalized = json.loads(json.dumps(dict(resources), allow_nan=False))
+    if not isinstance(normalized, dict):  # pragma: no cover - guaranteed above
+        raise WorkflowError("PiSSA preparation resource evidence is not a JSON object")
+    return normalized
 
 
 def _prepare_pissa(cpu: CpuAuditResult, gate_root: Path) -> tuple[Path, dict[str, Any]]:
