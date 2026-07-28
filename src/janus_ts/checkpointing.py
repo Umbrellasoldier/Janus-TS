@@ -232,20 +232,31 @@ def gather_lora_state_dict(
         key=lambda item: item[0],
     )
     non_lora = [name for name, _ in trainable if not _is_lora_parameter(name)]
-    non_fp32 = [name for name, parameter in trainable if parameter.dtype != torch.float32]
+    unsupported_dtype = [
+        name
+        for name, parameter in trainable
+        if parameter.dtype not in {torch.bfloat16, torch.float32}
+    ]
     trainable_count = sum(_logical_numel(parameter) for _, parameter in trainable)
-    if not trainable or non_lora or non_fp32 or trainable_count != expected_trainable_parameters:
+    if (
+        not trainable
+        or non_lora
+        or unsupported_dtype
+        or trainable_count != expected_trainable_parameters
+    ):
         raise CheckpointError(
             "trainable adapter contract failed: "
             f"parameters={trainable_count:,} (expected {expected_trainable_parameters:,}), "
-            f"non_lora={non_lora[:8]!r}, non_fp32={non_fp32[:8]!r}"
+            f"non_lora={non_lora[:8]!r}, unsupported_dtype={unsupported_dtype[:8]!r}"
         )
 
     gathered: dict[str, Any] | None = {} if coordinator.rank == 0 else None
     for name, parameter in trainable:
         with _gather_context(parameter):
             if gathered is not None:
-                gathered[name] = parameter.detach().cpu().clone().contiguous()
+                gathered[name] = (
+                    parameter.detach().to(device="cpu", dtype=torch.float32).clone().contiguous()
+                )
     return gathered
 
 

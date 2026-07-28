@@ -21,6 +21,7 @@ from janus_ts.checkpointing import (
     JanusCheckpointCallback,
     ResumeCheckpoint,
     convert_pissa_to_portable_state,
+    gather_lora_state_dict,
     normalize_lora_state_dict,
     select_resume_checkpoint,
 )
@@ -259,6 +260,21 @@ def test_adapter_key_normalization_rejects_wrong_adapter():
     }
     with pytest.raises(CheckpointError, match="unexpected LoRA"):
         normalize_lora_state_dict(state, adapter_name="other")
+
+
+def test_bf16_training_adapter_is_gathered_as_portable_fp32():
+    model = ToyPeftModel(fill=2.0).to(dtype=torch.bfloat16)
+    engine = FakeDeepSpeedEngine(model, global_steps=1)
+
+    gathered = gather_lora_state_dict(
+        engine,
+        SimpleNamespace(rank=0),
+        expected_trainable_parameters=4,
+    )
+
+    assert gathered is not None
+    assert gathered
+    assert {tensor.dtype for tensor in gathered.values()} == {torch.float32}
 
 
 def test_atomic_save_excludes_frozen_base_and_exactly_restores(tmp_path):
