@@ -1,1 +1,3 @@
 patches/*.patch -whitespace
+src/janus_ts/discretization.py -whitespace
+src/janus_ts/schema.py -whitespace

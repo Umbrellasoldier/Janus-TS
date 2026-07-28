@@ -101,3 +101,4 @@ def canonical_edges(edges: Iterable[Edge]) -> tuple[Edge, ...]:
     if len(pairs) != len(set(pairs)):
         raise ValueError("duplicate edge pair")
     return result
+

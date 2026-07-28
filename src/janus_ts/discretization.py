@@ -44,3 +44,4 @@ def format_bond_order(value: float) -> str:
     if number not in {0.5, 1.0, 1.5, 2.0, 2.5, 3.0}:
         raise ValueError(f"unsupported bond-order bin: {value!r}")
     return str(int(number)) if number.is_integer() else str(number)
+
