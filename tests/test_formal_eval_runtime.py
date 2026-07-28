@@ -282,9 +282,6 @@ def test_formal_engine_precision_audits_shards_without_optimizer() -> None:
             for parameter in self.parameters():
                 parameter.ds_id = id(parameter)
                 parameter.ds_tensor = parameter.detach().clone()
-            self.lora_A["default"].comm_dtype = torch.bfloat16
-            self.lora_B["default"].comm_dtype = torch.bfloat16
-
     engine = SimpleNamespace(
         module=Module(),
         zero_optimization_stage=lambda: 3,

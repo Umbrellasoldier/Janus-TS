@@ -4,9 +4,7 @@
   "torch_autocast": {
     "enabled": false,
     "dtype": "bfloat16",
-    "lower_precision_safe_modules": [
-      "torch.nn.modules.linear.Linear"
-    ]
+    "lower_precision_safe_modules": []
   },
   "train_micro_batch_size_per_gpu": "auto",
   "gradient_accumulation_steps": "auto",

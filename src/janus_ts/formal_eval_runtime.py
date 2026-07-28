@@ -603,7 +603,7 @@ def assert_formal_zero3_precision(
             problems.append(f"wrong shard dtype {name}={shard.dtype}")
         if _is_lora_parameter(name):
             communication_dtypes.add(str(get_comm_dtype(parameter)))
-    if communication_dtypes != {str(torch.bfloat16)}:
+    if communication_dtypes != {str(torch.float32)}:
         problems.append(f"LoRA communication dtypes={sorted(communication_dtypes)!r}")
     if problems:
         raise FormalEvalRuntimeError(
@@ -617,7 +617,7 @@ def assert_formal_zero3_precision(
         "torch_autocast_dtype": "bfloat16",
         "base_shard_dtype": "bfloat16",
         "adapter_shard_dtype": "float32",
-        "adapter_communication_dtype": "bfloat16",
+        "adapter_communication_dtype": "float32",
     }
 
 

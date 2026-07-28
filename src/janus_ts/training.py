@@ -13,7 +13,12 @@ from .constants import SEED
 from .modeling import EXPECTED_TRAINABLE_PARAMETERS
 from .tokenization import EpochAwareTokenizedDataset
 
-ZERO3_AUTOCAST_SAFE_MODULES = ("torch.nn.modules.linear.Linear",)
+# Keep this empty. DeepSpeed groups ZeRO-3 all-gathers by communication dtype
+# and then requires each coalesced group to have one storage dtype. Marking
+# every Linear as BF16-communication-safe would mix BF16 base weights with
+# FP32 LoRA weights in one group. The engine autocast context still performs
+# Linear compute in BF16; communication follows each parameter's storage dtype.
+ZERO3_AUTOCAST_SAFE_MODULES: tuple[str, ...] = ()
 
 
 class TrainingContractError(ValueError):
@@ -355,7 +360,7 @@ def assert_zero3_engine_precision_contract(
             storage_problems.append(f"wrong shard dtype {name}={shard.dtype}")
         if _is_lora_parameter(name):
             adapter_comm_dtypes.add(str(get_comm_dtype(parameter)))
-    if adapter_comm_dtypes != {str(torch.bfloat16)}:
+    if adapter_comm_dtypes != {str(torch.float32)}:
         storage_problems.append(f"LoRA communication dtypes={sorted(adapter_comm_dtypes)!r}")
 
     low_precision_groups = tuple(getattr(optimizer, "fp16_partitioned_groups_flat", ()))
@@ -398,7 +403,7 @@ def assert_zero3_engine_precision_contract(
         "zero_stage": 3,
         "native_bf16": False,
         "torch_autocast_dtype": "bfloat16",
-        "adapter_communication_dtype": "bfloat16",
+        "adapter_communication_dtype": "float32",
         "adapter_shard_dtype": "float32",
         "master_dtype": "float32",
         "optimizer_state_tensors": state_tensors,

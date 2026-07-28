@@ -63,12 +63,10 @@ class FakeZero3Optimizer:
 class FakeZero3Engine:
     def __init__(self, model: nn.Module, *, state_initialized: bool = True) -> None:
         self.module = model
-        for index, (name, parameter) in enumerate(model.named_parameters()):
+        for index, (_name, parameter) in enumerate(model.named_parameters()):
             parameter.ds_id = index
             parameter.ds_numel = parameter.numel()
             parameter.ds_tensor = parameter.detach().clone()
-            if "lora_A." in name or "lora_B." in name:
-                parameter.comm_dtype = torch.bfloat16
         self.optimizer = FakeZero3Optimizer(model, state_initialized=state_initialized)
 
     @staticmethod
@@ -216,7 +214,7 @@ def test_zero3_engine_precision_gate_checks_shards_masters_and_states():
 
     assert report["adapter_shard_dtype"] == "float32"
     assert report["master_dtype"] == "float32"
-    assert report["adapter_communication_dtype"] == "bfloat16"
+    assert report["adapter_communication_dtype"] == "float32"
     assert report["optimizer_state_dtype"] == "float32"
 
 
@@ -230,7 +228,7 @@ def test_zero3_engine_precision_gate_rejects_missing_adam_state():
         )
 
 
-def test_two_rank_dtype_gate_config_uses_runtime_autocast_contract():
+def test_two_rank_dtype_gate_keeps_mixed_storage_communication_separate():
     gate = build_tiny_zero3_dtype_gate_config()
 
     assert gate["bf16"]["enabled"] is False
@@ -238,7 +236,7 @@ def test_two_rank_dtype_gate_config_uses_runtime_autocast_contract():
     assert gate["torch_autocast"] == {
         "enabled": True,
         "dtype": "bfloat16",
-        "lower_precision_safe_modules": ["torch.nn.modules.linear.Linear"],
+        "lower_precision_safe_modules": [],
     }
     assert gate["zero_optimization"]["stage"] == 3
     assert gate["zero_optimization"]["offload_optimizer"]["device"] == "none"
