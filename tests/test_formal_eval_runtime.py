@@ -183,7 +183,7 @@ class _TinyPortableModel(torch.nn.Module):
         self.generation_config = SimpleNamespace(pad_token_id=None, eos_token_id=None)
 
 
-def test_portable_loader_uses_original_base_and_switches_precision_after_adapter(
+def test_portable_loader_uses_original_base_and_validates_bf16_after_adapter(
     tmp_path: Path,
 ) -> None:
     config = load_config("configs/transition1x.yaml")
@@ -204,7 +204,7 @@ def test_portable_loader_uses_original_base_and_switches_precision_after_adapter
         assert path == checkpoint.portable_adapter_path
         assert kwargs == {
             "is_trainable": True,
-            "autocast_adapter_dtype": True,
+            "autocast_adapter_dtype": False,
             "low_cpu_mem_usage": False,
         }
         return base_model
@@ -216,7 +216,7 @@ def test_portable_loader_uses_original_base_and_switches_precision_after_adapter
         assert named["base.weight"].requires_grad is False
         assert named["base.weight"].dtype == torch.bfloat16
         assert named["lora_A.default.weight"].requires_grad is True
-        assert named["lora_A.default.weight"].dtype == torch.float32
+        assert named["lora_A.default.weight"].dtype == torch.bfloat16
         assert named["lora_B.default.weight"].requires_grad is True
         return {"phase": "formal"}
 
@@ -228,7 +228,7 @@ def test_portable_loader_uses_original_base_and_switches_precision_after_adapter
         adapter_loader=adapter_loader,
         zero3_validator=lambda _arguments: events.append("zero3"),
         portable_config_validator=lambda _path, _config: events.append("validate"),
-        precision_activator=precision,
+        precision_validator=precision,
     )
 
     assert model is base
@@ -270,24 +270,23 @@ def test_formal_engine_precision_audits_shards_without_optimizer() -> None:
     class Module(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.base = torch.nn.Parameter(
-                torch.ones(2, dtype=torch.bfloat16), requires_grad=False
-            )
+            self.base = torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16), requires_grad=False)
             self.lora_A = torch.nn.ParameterDict(
-                {"default": torch.nn.Parameter(torch.ones(1, dtype=torch.float32))}
+                {"default": torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))}
             )
             self.lora_B = torch.nn.ParameterDict(
-                {"default": torch.nn.Parameter(torch.ones(1, dtype=torch.float32))}
+                {"default": torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))}
             )
             for parameter in self.parameters():
                 parameter.ds_id = id(parameter)
                 parameter.ds_tensor = parameter.detach().clone()
+
     engine = SimpleNamespace(
         module=Module(),
         zero_optimization_stage=lambda: 3,
-        bfloat16_enabled=lambda: False,
+        bfloat16_enabled=lambda: True,
         fp16_enabled=lambda: False,
-        torch_autocast_enabled=lambda: True,
+        torch_autocast_enabled=lambda: False,
         torch_autocast_dtype=lambda: torch.bfloat16,
     )
     report = assert_formal_zero3_precision(
@@ -295,9 +294,9 @@ def test_formal_engine_precision_audits_shards_without_optimizer() -> None:
         expected_trainable_parameters=2,
     )
     assert report["zero_stage"] == 3
-    assert report["adapter_shard_dtype"] == "float32"
+    assert report["adapter_shard_dtype"] == "bfloat16"
 
-    engine.module.lora_A["default"].ds_tensor = torch.ones(1, dtype=torch.bfloat16)
+    engine.module.lora_A["default"].ds_tensor = torch.ones(1, dtype=torch.float32)
     with pytest.raises(FormalEvalRuntimeError, match="wrong shard dtype"):
         assert_formal_zero3_precision(engine, expected_trainable_parameters=2)
 
@@ -447,12 +446,15 @@ def test_completed_test_rebuilds_missing_receipt_and_never_loads_model(
     assert first is not None and second is not None
     assert first.payload == second.payload
     assert first.path.is_file()
-    assert validate_runtime_receipt(
-        first.path,
-        checkpoint_dir,
-        processed,
-        config=config,
-    ).payload == first.payload
+    assert (
+        validate_runtime_receipt(
+            first.path,
+            checkpoint_dir,
+            processed,
+            config=config,
+        ).payload
+        == first.payload
+    )
 
 
 def test_load_checkpoint_score_reconstructs_exact_at10_fractions(tmp_path: Path) -> None:

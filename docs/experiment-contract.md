@@ -92,18 +92,10 @@ disk-backed and content-addressed; no truncation is permitted.
   `<|im_end|>`.
 - Maximum full sequence length 2,048, dynamic padding to a multiple of 8, and
   hard failure instead of truncation.
-- BF16 frozen base and FP32 trainable adapters. This is implemented as an
-  audited two-phase DeepSpeed precision contract: native BF16 is enabled only
-  while ZeRO-Init streams and partitions the residual base; before Trainer
-  initializes its engine, native BF16 is disabled and DeepSpeed
-  `torch_autocast` is enabled with dtype BF16. No module class is marked as a
-  lower-precision communication-safe module: this keeps BF16 base parameters
-  and FP32 LoRA parameters in separate ZeRO-3 all-gathers while autocast still
-  executes Linear operations in BF16. This prevents DeepSpeed from recasting LoRA storage to BF16. The
-  persistent LoRA ZeRO shards, gradient-accumulation buffers, AdamW master
-  weights, AdamW moments, and LoRA communication remain FP32; Linear
-  forward/backward compute uses BF16. Both the pre-engine and post-engine dtypes are
-  hard gates.
+- Native BF16 frozen base and trainable adapters. Base weights, LoRA weights,
+  persistent ZeRO shards, gradient communication, and forward/backward compute
+  all use BF16; DeepSpeed `torch_autocast` is disabled. AdamW master weights
+  and moments remain FP32. Pre-engine and post-engine dtypes are hard gates.
 - Exact LoRA coverage: 496 projections across all 64 layers. Rank 32,
   alpha 16, rsLoRA enabled, dropout 0, bias none, PiSSA `pissa_niter_16`.
   Expected trainable parameter count: 233,455,616.

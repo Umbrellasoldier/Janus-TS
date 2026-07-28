@@ -96,9 +96,7 @@ class DelegatedProcessError(WorkflowError):
         self.phase = phase
         self.command = tuple(command)
         self.returncode = int(returncode)
-        super().__init__(
-            f"{phase} failed permanently with exit {returncode}: {' '.join(command)}"
-        )
+        super().__init__(f"{phase} failed permanently with exit {returncode}: {' '.join(command)}")
 
 
 class _DelegatedSignalInterrupt(BaseException):
@@ -344,9 +342,7 @@ def seal_stage(
     return stored
 
 
-def load_stage(
-    destination: str | Path, *, stage: str, fingerprint: str
-) -> dict[str, Any] | None:
+def load_stage(destination: str | Path, *, stage: str, fingerprint: str) -> dict[str, Any] | None:
     """Load a completed stage by explicit identity; incomplete trees are ignored."""
 
     target = Path(destination)
@@ -395,9 +391,7 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
         processed = PROJECT_ROOT / processed
     processed = processed.resolve(strict=True)
     tokenizer = load_pinned_tokenizer(config, local_files_only=True)
-    data_audit = dict(
-        audit_processed_dataset(processed, config, tokenizer=tokenizer, write=False)
-    )
+    data_audit = dict(audit_processed_dataset(processed, config, tokenizer=tokenizer, write=False))
     # The underlying audit optionally records when it was run for human-facing
     # audit.json files.  An immutable workflow stage must contain only content
     # evidence, never the unreliable gu30 wall clock.
@@ -410,9 +404,7 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
     from .v24 import audit_v24_source
 
     processed_dataset = load_processed_dataset(processed)
-    v24_source = audit_v24_source(
-        current_test_ids=tuple(processed_dataset["test"]["reaction_id"])
-    )
+    v24_source = audit_v24_source(current_test_ids=tuple(processed_dataset["test"]["reaction_id"]))
     report = {
         "schema_version": WORKFLOW_SCHEMA_VERSION,
         "status": "pass",
@@ -537,10 +529,7 @@ def _require_success(outcome: CommandOutcome) -> None:
 
 def _stage_root(cpu: CpuAuditResult) -> Path:
     path = (
-        cpu.config.runtime.artifacts_root
-        / "gates"
-        / cpu.config.data.name
-        / cpu.launch_fingerprint
+        cpu.config.runtime.artifacts_root / "gates" / cpu.config.data.name / cpu.launch_fingerprint
     )
     return path if path.is_absolute() else PROJECT_ROOT / path
 
@@ -618,10 +607,8 @@ def _pissa_resource_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
         raise WorkflowError("PiSSA gate did not return preparation resource evidence")
     if (
         resources.get("policy") != PISSA_RESOURCE_POLICY
-        or resources.get("scope")
-        not in {"full_serialization", "cached_payload_verification"}
-        or resources.get("minimum_mem_available_kib")
-        != PISSA_MIN_MEM_AVAILABLE_KIB
+        or resources.get("scope") not in {"full_serialization", "cached_payload_verification"}
+        or resources.get("minimum_mem_available_kib") != PISSA_MIN_MEM_AVAILABLE_KIB
         or resources.get("swap_growth_is_diagnostic") is not True
         or resources.get("other_gpu_phases_max_swap_growth_kib") != 256 * 1024
         or type(resources.get("observed_swap_growth_kib")) is not int
@@ -642,9 +629,27 @@ def _prepare_pissa(cpu: CpuAuditResult, gate_root: Path) -> tuple[Path, dict[str
     stage = gate_root / "03-pissa"
     bundle = pissa_bundle_path(cpu.config.runtime.local_cache_root)
     prior = load_stage(stage, stage="pissa", fingerprint=cpu.launch_fingerprint)
+    if prior is not None:
+        _pissa_resource_evidence(prior)
+        manifest_sha256 = sha256_file(bundle / "manifest.json")
+        files_sha256 = prior.get("files_sha256")
+        if not isinstance(files_sha256, str) or len(files_sha256) != 64:
+            raise WorkflowError("sealed PiSSA stage has no aggregate payload hash")
+        expected = {
+            "bundle": str(bundle),
+            "manifest_sha256": manifest_sha256,
+        }
+        drift = {
+            key: {"sealed": prior.get(key), "current": value}
+            for key, value in expected.items()
+            if prior.get(key) != value
+        }
+        if drift:
+            raise WorkflowError(f"cached PiSSA stage drift: {drift}")
+        return bundle, prior
+
     # prepare_pissa_gate owns the same non-reentrant lock internally.  Do not
-    # wrap this call in another flock. It also hashes an existing bundle once,
-    # so no second 54.7 GB payload pass is needed here.
+    # wrap this call in another flock.
     report = prepare_pissa_gate(
         hub_cache_dir=cpu.config.model.cache_dir,
         local_cache_root=cpu.config.runtime.local_cache_root,
@@ -655,21 +660,6 @@ def _prepare_pissa(cpu: CpuAuditResult, gate_root: Path) -> tuple[Path, dict[str
     files_sha256 = report.get("files_sha256")
     if not isinstance(files_sha256, str) or len(files_sha256) != 64:
         raise WorkflowError("PiSSA gate did not return the aggregate payload hash")
-    if prior is not None:
-        _pissa_resource_evidence(prior)
-        expected = {
-            "bundle": str(bundle),
-            "manifest_sha256": manifest_sha256,
-            "files_sha256": files_sha256,
-        }
-        drift = {
-            key: {"sealed": prior.get(key), "current": value}
-            for key, value in expected.items()
-            if prior.get(key) != value
-        }
-        if drift:
-            raise WorkflowError(f"cached PiSSA stage drift: {drift}")
-        return bundle, prior
     evidence = {
         "status": "pass",
         "bundle": str(bundle),
@@ -766,9 +756,7 @@ def _smoke_report_status(report_path: Path) -> tuple[str | None, dict[str, Any] 
     return None, None
 
 
-def _smoke_gate_binding(
-    prepared: PreparedRun, *, micro_batch_size: int
-) -> dict[str, str]:
+def _smoke_gate_binding(prepared: PreparedRun, *, micro_batch_size: int) -> dict[str, str]:
     deepspeed_config = prepared.config.train.deepspeed_config
     if not deepspeed_config.is_absolute():
         deepspeed_config = PROJECT_ROOT / deepspeed_config
@@ -823,9 +811,7 @@ def _matching_rank_oom_reports(
         gate = payload.get("gate")
         status = payload.get("status")
         sequence = payload.get("sequence_length", payload.get("max_sequence_length"))
-        microbatch = payload.get(
-            "micro_batch_size_per_gpu", payload.get("micro_batch_size")
-        )
+        microbatch = payload.get("micro_batch_size_per_gpu", payload.get("micro_batch_size"))
         if (
             gate == "zero3-worst-case-2048-one-update"
             and status in {"oom", "rejected"}
@@ -845,9 +831,7 @@ def _validate_smoke_pass(
 ) -> None:
     config = prepared.config
     binding = _smoke_gate_binding(prepared, micro_batch_size=micro_batch_size)
-    if report.get("status") != "pass" or report.get("gate") != (
-        "zero3-worst-case-2048-one-update"
-    ):
+    if report.get("status") != "pass" or report.get("gate") != ("zero3-worst-case-2048-one-update"):
         raise WorkflowError("memory smoke report is not a passing frozen gate")
     if not _is_bound_smoke_report(report, binding):
         raise WorkflowError("memory smoke report is bound to different inputs")
@@ -856,9 +840,7 @@ def _validate_smoke_pass(
     ranks = report.get("ranks")
     if not isinstance(ranks, list) or len(ranks) != config.runtime.required_gpu_count:
         raise WorkflowError("memory smoke report does not contain exactly two ranks")
-    observed_ranks = {
-        item.get("rank") for item in ranks if isinstance(item, Mapping)
-    }
+    observed_ranks = {item.get("rank") for item in ranks if isinstance(item, Mapping)}
     if observed_ranks != set(range(config.runtime.required_gpu_count)):
         raise WorkflowError("memory smoke rank set is not exactly {0,1}")
     expected_accumulation = (
@@ -926,9 +908,7 @@ def _run_memory_smoke(
         fingerprint=prepared.run_identity.fingerprint,
     ):
         return report.get("decision") == "selected", report
-    raw_report = (
-        prepared.gate_root / "raw" / f"memory-micro{micro_batch_size}.json"
-    ).resolve()
+    raw_report = (prepared.gate_root / "raw" / f"memory-micro{micro_batch_size}.json").resolve()
     binding = _smoke_gate_binding(prepared, micro_batch_size=micro_batch_size)
     prior_status, prior_raw = _smoke_report_status(raw_report)
     prior_rank_rejections = _matching_rank_oom_reports(
@@ -1136,8 +1116,7 @@ def _run_resume_continuity_gate(
             not isinstance(stream, Mapping)
             or stream.get("logical_parameters")
             != prepared.config.adapter.expected_trainable_parameters
-            or stream.get("tensor_count")
-            != prepared.config.adapter.expected_target_modules * 2
+            or stream.get("tensor_count") != prepared.config.adapter.expected_target_modules * 2
         ):
             raise WorkflowError("resume continuity LoRA stream has the wrong coverage")
         ranks = report.get("ranks")
@@ -1155,8 +1134,7 @@ def _run_resume_continuity_gate(
             resumed = item.get("resumed")
             rank_comparison = item.get("comparison")
             if not all(
-                isinstance(value, Mapping)
-                for value in (continuous, resumed, rank_comparison)
+                isinstance(value, Mapping) for value in (continuous, resumed, rank_comparison)
             ):
                 raise WorkflowError("resume continuity rank branches are missing")
             if any(
@@ -1256,9 +1234,7 @@ def prepare_smoke_workflow(
         micro_batch_size_per_gpu=cpu.config.train.micro_batch_size_per_gpu,
         gradient_accumulation_steps=cpu.config.train.gradient_accumulation_steps,
     )
-    provisional_paths = _absolute_run_paths(
-        resolve_run_paths(cpu.config, provisional_run_identity)
-    )
+    provisional_paths = _absolute_run_paths(resolve_run_paths(cpu.config, provisional_run_identity))
     provisional_checkpoint_identity = derive_checkpoint_identity(
         provisional_run_identity,
         pissa_manifest_sha256=provisional_run_identity.pissa_manifest_sha256,
@@ -1278,9 +1254,7 @@ def prepare_smoke_workflow(
     default_passed, _ = _run_memory_smoke(provisional, micro_batch_size=1, runner=runner)
     if not default_passed:
         raise WorkflowError("the frozen default microbatch-1 geometry failed its hard gate")
-    candidate_passed, _ = _run_memory_smoke(
-        provisional, micro_batch_size=2, runner=runner
-    )
+    candidate_passed, _ = _run_memory_smoke(provisional, micro_batch_size=2, runner=runner)
     if candidate_passed:
         microbatch = cpu.config.train.candidate_micro_batch_size_per_gpu
         accumulation = cpu.config.train.candidate_gradient_accumulation_steps
@@ -1399,9 +1373,7 @@ class RankZeroJsonlLogCallback(TrainerCallback):
         self.path = Path(path)
         self.run_fingerprint = run_fingerprint
         self.resume_checkpoint = (
-            str(Path(resume_checkpoint).resolve())
-            if resume_checkpoint is not None
-            else None
+            str(Path(resume_checkpoint).resolve()) if resume_checkpoint is not None else None
         )
         self._rank = int(os.environ.get("RANK", "0"))
         self.launch_ordinal = self._next_launch_ordinal() if self._rank == 0 else -1
@@ -1431,9 +1403,7 @@ class RankZeroJsonlLogCallback(TrainerCallback):
                 for line_number, line in enumerate(text_payload.splitlines(), start=1):
                     payload = json.loads(line)
                     if not isinstance(payload, dict):
-                        raise WorkflowError(
-                            f"training JSONL line {line_number} is not an object"
-                        )
+                        raise WorkflowError(f"training JSONL line {line_number} is not an object")
                     if payload.get("run_fingerprint") != self.run_fingerprint:
                         raise WorkflowError("training JSONL contains a foreign run fingerprint")
                     ordinal = payload.get("launch_ordinal")
@@ -1464,8 +1434,7 @@ class RankZeroJsonlLogCallback(TrainerCallback):
             "logs": dict(logs or {}),
         }
         encoded = (
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            + "\n"
+            json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
         ).encode("utf-8")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(
@@ -1607,9 +1576,7 @@ def run_distributed_training_worker(
             raise WorkflowError("worker resume path is not the greatest valid manifest step")
         resume = selected
         run.trainer.janus_restore_hook = checkpoint_manager_restore_hook(manager, resume)
-    run.trainer.train(
-        resume_from_checkpoint=str(resume.path) if resume is not None else None
-    )
+    run.trainer.train(resume_from_checkpoint=str(resume.path) if resume is not None else None)
 
 
 def _training_command(prepared: PreparedRun, resume: ResumeCheckpoint | None) -> tuple[str, ...]:
@@ -1677,9 +1644,7 @@ def enumerate_epoch_checkpoints(prepared: PreparedRun) -> tuple[EpochCheckpoint,
             values[epoch] = candidate
     expected = set(range(1, prepared.config.train.epochs + 1))
     if set(values) != expected:
-        raise WorkflowError(
-            f"durable epoch set={sorted(values)}, expected={sorted(expected)}"
-        )
+        raise WorkflowError(f"durable epoch set={sorted(values)}, expected={sorted(expected)}")
     ordered = tuple(values[epoch] for epoch in sorted(values))
     if any(
         left.global_step >= right.global_step
@@ -1842,13 +1807,10 @@ def _run_portable_parity_gate(
             "model_fingerprint": prepared.checkpoint_identity.model_fingerprint,
             "epoch": checkpoint.epoch,
             "global_step": checkpoint.global_step,
-            "bundle_manifest_sha256": sha256_file(
-                prepared.bundle_dir / "manifest.json"
-            ),
+            "bundle_manifest_sha256": sha256_file(prepared.bundle_dir / "manifest.json"),
         }
         if not isinstance(checkpoint_report, Mapping) or any(
-            checkpoint_report.get(key) != value
-            for key, value in expected_checkpoint.items()
+            checkpoint_report.get(key) != value for key, value in expected_checkpoint.items()
         ):
             raise WorkflowError("portable parity report is bound to another checkpoint")
         residual = report.get("residual_rank32")
@@ -1871,8 +1833,7 @@ def _run_portable_parity_gate(
         probe = report.get("probe")
         if (
             not isinstance(probe, Mapping)
-            or probe.get("selection")
-            != "first-longest-legal-canonical-validation-prompt"
+            or probe.get("selection") != "first-longest-legal-canonical-validation-prompt"
             or isinstance(probe.get("prompt_tokens"), bool)
             or not isinstance(probe.get("prompt_tokens"), int)
             or not 0 < probe["prompt_tokens"] <= prepared.config.model.max_sequence_length
@@ -1881,9 +1842,7 @@ def _run_portable_parity_gate(
         ranks = report.get("ranks")
         if not isinstance(ranks, list) or len(ranks) != 2:
             raise WorkflowError("portable parity lacks two rank reports")
-        observed = {
-            item.get("rank") for item in ranks if isinstance(item, Mapping)
-        }
+        observed = {item.get("rank") for item in ranks if isinstance(item, Mapping)}
         if observed != {0, 1}:
             raise WorkflowError("portable parity rank set is not {0,1}")
         generation_smoke = report.get("generation_smoke")
@@ -1909,8 +1868,7 @@ def _run_portable_parity_gate(
         validate(report)
         return report
     raw_report = (
-        prepared.paths.evaluations
-        / f"portable-parity.{checkpoint.checkpoint_fingerprint}.json"
+        prepared.paths.evaluations / f"portable-parity.{checkpoint.checkpoint_fingerprint}.json"
     ).resolve()
     command = torchrun_command(
         "janus_ts.continuity_gates",
@@ -1995,14 +1953,15 @@ def _run_one_formal_evaluation(
         / "workflow"
         / f"{split}-epoch-{checkpoint.epoch}-{checkpoint.checkpoint_fingerprint}"
     )
-    if load_stage(
-        stage,
-        stage=f"formal-{split}",
-        fingerprint=checkpoint.checkpoint_fingerprint,
-    ) is not None:
-        return _validate_formal_receipt(
-            prepared, checkpoint, split=split
+    if (
+        load_stage(
+            stage,
+            stage=f"formal-{split}",
+            fingerprint=checkpoint.checkpoint_fingerprint,
         )
+        is not None
+    ):
+        return _validate_formal_receipt(prepared, checkpoint, split=split)
 
     # A worker can be interrupted after its content-addressed result/receipt
     # is durable but before this small workflow stage is sealed.  Validate (or,
@@ -2031,13 +1990,9 @@ def _run_one_formal_evaluation(
             selection_proof,
             durable.generation_identity("test"),
         )
-        recovered = (
-            recover_completed_test(prepared.paths.evaluations, durable) is not None
-        )
+        recovered = recover_completed_test(prepared.paths.evaluations, durable) is not None
     if recovered:
-        metrics, predictions = _validate_formal_receipt(
-            prepared, checkpoint, split=split
-        )
+        metrics, predictions = _validate_formal_receipt(prepared, checkpoint, split=split)
         report = {
             "status": "pass",
             "split": split,

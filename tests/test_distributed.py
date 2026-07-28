@@ -153,11 +153,11 @@ class _TinyContractModel:
             ("base_model.model.embed_tokens.weight", _Parameter(100, torch.bfloat16, False)),
             (
                 "base_model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
-                _Parameter(adapter_count // 2, torch.float32, True),
+                _Parameter(adapter_count // 2, torch.bfloat16, True),
             ),
             (
                 "base_model.model.layers.0.self_attn.q_proj.lora_B.default.weight",
-                _Parameter(adapter_count - adapter_count // 2, torch.float32, True),
+                _Parameter(adapter_count - adapter_count // 2, torch.bfloat16, True),
             ),
         ]
 
@@ -303,7 +303,7 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
     )
     monkeypatch.setattr(
         distributed,
-        "activate_zero3_fp32_lora_training_phase",
+        "assert_zero3_bf16_precision",
         lambda arguments, value: {"phase": "training"},
     )
 
@@ -334,7 +334,7 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
     assert not any("offload" in name for name in calls["base"])
     assert calls["adapter"][2] == {
         "is_trainable": True,
-        "autocast_adapter_dtype": True,
+        "autocast_adapter_dtype": False,
         "low_cpu_mem_usage": False,
     }
     assert model.events == [
@@ -343,7 +343,7 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
         "train",
     ]
     assert model.config.use_cache is False
-    assert model._janus_ts_precision_switch_report == {"phase": "training"}
+    assert model._janus_ts_precision_report == {"phase": "training"}
 
 
 def test_full_builder_constructs_arguments_before_model_and_exposes_callback_hook(
@@ -467,6 +467,7 @@ def test_managed_trainer_restores_fresh_engine_and_suppresses_native_io(
     )
     trainer = object.__new__(distributed.JanusManagedTrainer)
     trainer.janus_managed_checkpoints = True
+
     def restore(received, path):
         calls.append(("restore", received.model_wrapped, path))
 

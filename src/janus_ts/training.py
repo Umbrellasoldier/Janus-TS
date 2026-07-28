@@ -13,11 +13,9 @@ from .constants import SEED
 from .modeling import EXPECTED_TRAINABLE_PARAMETERS
 from .tokenization import EpochAwareTokenizedDataset
 
-# Keep this empty. DeepSpeed groups ZeRO-3 all-gathers by communication dtype
-# and then requires each coalesced group to have one storage dtype. Marking
-# every Linear as BF16-communication-safe would mix BF16 base weights with
-# FP32 LoRA weights in one group. The engine autocast context still performs
-# Linear compute in BF16; communication follows each parameter's storage dtype.
+# Native BF16 already gives every floating parameter one storage and
+# communication dtype, so DeepSpeed's separate torch-autocast mechanism stays
+# disabled and needs no lower-precision-safe module allowlist.
 ZERO3_AUTOCAST_SAFE_MODULES: tuple[str, ...] = ()
 
 
@@ -40,12 +38,12 @@ def _logical_numel(parameter: Any) -> int:
     return int(getattr(parameter, "ds_numel", parameter.numel()))
 
 
-def assert_bf16_base_fp32_lora_parameters(
+def assert_bf16_model_parameters(
     model: Any,
     *,
     expected_trainable_parameters: int = EXPECTED_TRAINABLE_PARAMETERS,
 ) -> dict[str, Any]:
-    """Require BF16 frozen base parameters and FP32 trainable LoRA storage.
+    """Require BF16 storage for the frozen base and trainable LoRA parameters.
 
     The check is valid both before and after ZeRO-3 initialization.  For a
     partitioned parameter, ``Parameter.dtype`` still describes its persistent
@@ -66,8 +64,8 @@ def assert_bf16_base_fp32_lora_parameters(
             adapter_tensors += 1
             if not parameter.requires_grad:
                 problems.append(f"frozen adapter {name}")
-            if parameter.dtype != torch.float32:
-                problems.append(f"non-FP32 adapter {name}={parameter.dtype}")
+            if parameter.dtype != torch.bfloat16:
+                problems.append(f"non-BF16 adapter {name}={parameter.dtype}")
         else:
             base_count += logical_numel
             base_tensors += 1
@@ -95,7 +93,7 @@ def assert_bf16_base_fp32_lora_parameters(
         "base_parameters": base_count,
         "base_tensors": base_tensors,
         "base_trainable": False,
-        "adapter_dtype": "float32",
+        "adapter_dtype": "bfloat16",
         "adapter_parameters": adapter_count,
         "adapter_tensors": adapter_tensors,
         "adapter_trainable": True,
@@ -127,8 +125,8 @@ def _assert_zero3_no_offload(config: dict[str, Any]) -> None:
             raise TrainingContractError(f"{key} must explicitly use device=none")
 
 
-def assert_zero3_bf16_load_phase(args: TrainingArguments) -> dict[str, Any]:
-    """Audit the temporary native-BF16 phase used only by ZeRO-Init loading."""
+def assert_zero3_bf16_runtime(args: TrainingArguments) -> dict[str, Any]:
+    """Audit the single native-BF16 configuration used for load and training."""
 
     import torch
 
@@ -148,98 +146,33 @@ def assert_zero3_bf16_load_phase(args: TrainingArguments) -> dict[str, Any]:
         or hf_config.dtype() != torch.bfloat16
     ):
         raise TrainingContractError(
-            "DeepSpeed load phase must be native BF16 with torch_autocast disabled"
+            "DeepSpeed runtime must use native BF16 with torch_autocast disabled"
         )
     return {
-        "phase": "zero3_init_load",
+        "phase": "zero3_native_bf16",
         "zero_stage": 3,
         "native_bf16": True,
         "torch_autocast": False,
-        "parameter_creation_dtype": "bfloat16",
-        "offload": False,
-    }
-
-
-def assert_zero3_fp32_lora_training_phase(args: TrainingArguments) -> dict[str, Any]:
-    """Audit the runtime config after switching from loading to training."""
-
-    import torch
-
-    hf_config, _, config = _deepspeed_runtime_handles(args)
-    _assert_zero3_no_offload(config)
-    autocast = config.get("torch_autocast")
-    if (
-        config.get("bf16", {}).get("enabled") is not False
-        or config.get("fp16", {}).get("enabled") is not False
-        or not isinstance(autocast, dict)
-        or autocast.get("enabled") is not True
-        or autocast.get("dtype") != "bfloat16"
-        or tuple(autocast.get("lower_precision_safe_modules", ())) != ZERO3_AUTOCAST_SAFE_MODULES
-        or args.bf16 is not False
-        or args.fp16 is not False
-        or args.mixed_precision != "no"
-        or hf_config.dtype() != torch.float32
-    ):
-        raise TrainingContractError(
-            "DeepSpeed training phase must use BF16 torch_autocast with native BF16 disabled"
-        )
-    return {
-        "phase": "zero3_fp32_lora_training",
-        "zero_stage": 3,
-        "native_bf16": False,
-        "torch_autocast": True,
-        "autocast_dtype": "bfloat16",
-        "autocast_safe_modules": list(ZERO3_AUTOCAST_SAFE_MODULES),
+        "parameter_dtype": "bfloat16",
         "optimizer_master_dtype": "float32",
         "offload": False,
     }
 
 
-def activate_zero3_fp32_lora_training_phase(
+def assert_zero3_bf16_precision(
     args: TrainingArguments,
     model: Any,
     *,
     expected_trainable_parameters: int = EXPECTED_TRAINABLE_PARAMETERS,
 ) -> dict[str, Any]:
-    """Atomically switch the in-memory DS config after BF16 model loading.
+    """Audit the model and runtime without mutating either one."""
 
-    DeepSpeed's native BF16 engine mode casts *every* floating parameter to
-    BF16.  It therefore cannot preserve FP32 LoRA storage.  The pinned
-    DeepSpeed 0.19.2 torch-autocast path supports heterogeneous persistent
-    parameter dtypes and FP32 ZeRO optimizer masters while executing Linear
-    operations in BF16.  The on-disk config remains the immutable load-phase
-    input; this explicit, audited mutation is part of the run manifest.
-    """
-
-    parameter_report = assert_bf16_base_fp32_lora_parameters(
+    parameter_report = assert_bf16_model_parameters(
         model, expected_trainable_parameters=expected_trainable_parameters
     )
-    load_report = assert_zero3_bf16_load_phase(args)
-    hf_config, _, config = _deepspeed_runtime_handles(args)
-
-    config["bf16"]["enabled"] = False
-    config["fp16"]["enabled"] = False
-    config["torch_autocast"]["enabled"] = True
-
-    # Accelerator derives the native DeepSpeed mode from this frozen field.
-    # Once the model exists, DeepSpeed itself owns the autocast context.
-    args.bf16 = False
-    args.fp16 = False
-    args.mixed_precision = "no"
-    if getattr(hf_config, "mismatches", None):
-        raise TrainingContractError(
-            f"DeepSpeed config had pre-existing mismatches: {hf_config.mismatches!r}"
-        )
-    hf_config.trainer_config_process(args)
-    if getattr(hf_config, "mismatches", None):
-        raise TrainingContractError(
-            f"DeepSpeed config mismatched after precision switch: {hf_config.mismatches!r}"
-        )
-
-    training_report = assert_zero3_fp32_lora_training_phase(args)
+    runtime_report = assert_zero3_bf16_runtime(args)
     return {
-        "load_phase": load_report,
-        "training_phase": training_report,
+        "runtime": runtime_report,
         "parameters": parameter_report,
     }
 
@@ -248,18 +181,16 @@ def assert_accelerate_zero3_precision_state(
     args: TrainingArguments,
     accelerator: Any | None = None,
 ) -> dict[str, Any]:
-    """Prove Accelerate selected and copied the post-switch DS config.
+    """Prove Accelerate selected and copied the native-BF16 DS config.
 
     ``DeepSpeedPlugin.select()`` creates a defensive ``HfDeepSpeedConfig``
-    copy and makes that copy Transformers' process-global ZeRO-3 weakref.  A
-    stale pre-switch copy would make later model construction or an engine
-    rebuild silently re-enable native BF16.  Call this after constructing
-    Trainer and before ``trainer.train()``.
+    copy and makes that copy Transformers' process-global ZeRO-3 weakref.
+    Call this after constructing Trainer and before ``trainer.train()``.
     """
 
     from transformers.integrations.deepspeed import deepspeed_config
 
-    training_report = assert_zero3_fp32_lora_training_phase(args)
+    runtime_report = assert_zero3_bf16_runtime(args)
     _, plugin, config = _deepspeed_runtime_handles(args)
     selected_config = getattr(plugin, "dschf", None)
     selected_payload = getattr(selected_config, "config", None)
@@ -288,19 +219,19 @@ def assert_accelerate_zero3_precision_state(
             raise TrainingContractError(
                 f"Accelerator distributed_type is not DeepSpeed: {distributed_type!r}"
             )
-        if mixed_precision != "no":
+        if mixed_precision != "bf16":
             raise TrainingContractError(
-                f"Accelerator native mixed precision must be disabled, got {mixed_precision!r}"
+                f"Accelerator mixed precision must be BF16, got {mixed_precision!r}"
             )
         accelerator_report = {
             "checked": True,
             "distributed_type": "DEEPSPEED",
-            "mixed_precision": "no",
+            "mixed_precision": "bf16",
             "active_plugin_identity": True,
         }
 
     return {
-        "training_phase": training_report,
+        "runtime": runtime_report,
         "plugin_selected": True,
         "selected_config_is_copy": True,
         "transformers_weakref_identity": True,
@@ -323,7 +254,6 @@ def assert_zero3_engine_precision_contract(
         "bfloat16_enabled",
         "fp16_enabled",
         "torch_autocast_enabled",
-        "torch_autocast_dtype",
         "zero_optimization_stage",
     )
     missing_methods = [
@@ -333,10 +263,9 @@ def assert_zero3_engine_precision_contract(
         raise TrainingContractError(f"not a DeepSpeed engine; missing {missing_methods!r}")
     if (
         engine.zero_optimization_stage() != 3
-        or engine.bfloat16_enabled()
+        or not engine.bfloat16_enabled()
         or engine.fp16_enabled()
-        or not engine.torch_autocast_enabled()
-        or engine.torch_autocast_dtype() != torch.bfloat16
+        or engine.torch_autocast_enabled()
     ):
         raise TrainingContractError("initialized DeepSpeed engine has the wrong precision mode")
 
@@ -344,7 +273,7 @@ def assert_zero3_engine_precision_contract(
     optimizer = getattr(engine, "optimizer", None)
     if module is None or optimizer is None:
         raise TrainingContractError("DeepSpeed engine has no module or ZeRO optimizer")
-    parameter_report = assert_bf16_base_fp32_lora_parameters(
+    parameter_report = assert_bf16_model_parameters(
         module, expected_trainable_parameters=expected_trainable_parameters
     )
 
@@ -355,23 +284,22 @@ def assert_zero3_engine_precision_contract(
         if not hasattr(parameter, "ds_id") or shard is None:
             storage_problems.append(f"unpartitioned parameter {name}")
             continue
-        expected_dtype = torch.float32 if _is_lora_parameter(name) else torch.bfloat16
-        if parameter.is_floating_point() and shard.dtype != expected_dtype:
+        if parameter.is_floating_point() and shard.dtype != torch.bfloat16:
             storage_problems.append(f"wrong shard dtype {name}={shard.dtype}")
         if _is_lora_parameter(name):
             adapter_comm_dtypes.add(str(get_comm_dtype(parameter)))
-    if adapter_comm_dtypes != {str(torch.float32)}:
+    if adapter_comm_dtypes != {str(torch.bfloat16)}:
         storage_problems.append(f"LoRA communication dtypes={sorted(adapter_comm_dtypes)!r}")
 
     low_precision_groups = tuple(getattr(optimizer, "fp16_partitioned_groups_flat", ()))
     master_groups = tuple(getattr(optimizer, "fp32_partitioned_groups_flat", ()))
     if not low_precision_groups or any(
-        group.dtype != torch.float32 for group in low_precision_groups
+        group.dtype != torch.bfloat16 for group in low_precision_groups
     ):
-        storage_problems.append("ZeRO LoRA partitions are not all FP32")
+        storage_problems.append("ZeRO low-precision partitions are not all BF16")
     if not master_groups or any(group.dtype != torch.float32 for group in master_groups):
         storage_problems.append("ZeRO optimizer master partitions are not all FP32")
-    if getattr(optimizer, "dtype", None) != torch.float32:
+    if getattr(optimizer, "dtype", None) != torch.bfloat16:
         storage_problems.append(f"ZeRO optimizer dtype={getattr(optimizer, 'dtype', None)}")
     if getattr(optimizer, "master_weights_and_grads_dtype", None) != torch.float32:
         storage_problems.append(
@@ -401,10 +329,10 @@ def assert_zero3_engine_precision_contract(
     return {
         **parameter_report,
         "zero_stage": 3,
-        "native_bf16": False,
-        "torch_autocast_dtype": "bfloat16",
-        "adapter_communication_dtype": "float32",
-        "adapter_shard_dtype": "float32",
+        "native_bf16": True,
+        "torch_autocast": False,
+        "adapter_communication_dtype": "bfloat16",
+        "adapter_shard_dtype": "bfloat16",
         "master_dtype": "float32",
         "optimizer_state_tensors": state_tensors,
         "optimizer_state_dtype": "float32" if state_tensors else "not_initialized",
@@ -464,9 +392,7 @@ def build_training_argument_kwargs(
     if config.seed != SEED:
         raise TrainingContractError(f"seed must remain frozen at {SEED}")
     if not train.gradient_checkpointing or not train.gradient_checkpointing_use_reentrant:
-        raise TrainingContractError(
-            "ZeRO-3 training requires reentrant activation checkpointing"
-        )
+        raise TrainingContractError("ZeRO-3 training requires reentrant activation checkpointing")
     if not train.average_tokens_across_devices:
         raise TrainingContractError("global supervised-token normalization must remain enabled")
 

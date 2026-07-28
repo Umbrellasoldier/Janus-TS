@@ -17,24 +17,23 @@ from janus_ts.tokenization import EpochAwareTokenizedDataset, QwenTrainingEncode
 from janus_ts.training import (
     DatasetEpochCallback,
     TrainingContractError,
-    activate_zero3_fp32_lora_training_phase,
     assert_accelerate_zero3_precision_state,
-    assert_bf16_base_fp32_lora_parameters,
-    assert_zero3_bf16_load_phase,
+    assert_bf16_model_parameters,
+    assert_zero3_bf16_precision,
+    assert_zero3_bf16_runtime,
     assert_zero3_engine_precision_contract,
-    assert_zero3_fp32_lora_training_phase,
     build_training_argument_kwargs,
     build_training_arguments,
     logical_epoch_from_trainer_state,
 )
 
 
-class TinyMixedDtypeModel(nn.Module):
+class TinyBf16Model(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.base = nn.Linear(3, 2, bias=False, dtype=torch.bfloat16)
-        self.lora_A = nn.ModuleDict({"default": nn.Linear(3, 1, bias=False, dtype=torch.float32)})
-        self.lora_B = nn.ModuleDict({"default": nn.Linear(1, 2, bias=False, dtype=torch.float32)})
+        self.lora_A = nn.ModuleDict({"default": nn.Linear(3, 1, bias=False, dtype=torch.bfloat16)})
+        self.lora_B = nn.ModuleDict({"default": nn.Linear(1, 2, bias=False, dtype=torch.bfloat16)})
         self.base.requires_grad_(False)
 
 
@@ -46,16 +45,16 @@ class FakeZero3Optimizer:
             if "lora_A." in name or "lora_B." in name
         ]
         flat = torch.cat([parameter.detach().flatten() for parameter in adapter])
-        self.dtype = torch.float32
+        self.dtype = torch.bfloat16
         self.master_weights_and_grads_dtype = torch.float32
         self.fp16_partitioned_groups_flat = [flat]
-        self.fp32_partitioned_groups_flat = [flat.clone()]
+        self.fp32_partitioned_groups_flat = [flat.float()]
         state = {}
         if state_initialized:
             state[self.fp32_partitioned_groups_flat[0]] = {
                 "step": torch.tensor(1.0),
-                "exp_avg": torch.zeros_like(flat),
-                "exp_avg_sq": torch.zeros_like(flat),
+                "exp_avg": torch.zeros_like(flat, dtype=torch.float32),
+                "exp_avg_sq": torch.zeros_like(flat, dtype=torch.float32),
             }
         self.optimizer = SimpleNamespace(state=state)
 
@@ -75,7 +74,7 @@ class FakeZero3Engine:
 
     @staticmethod
     def bfloat16_enabled():
-        return False
+        return True
 
     @staticmethod
     def fp16_enabled():
@@ -83,7 +82,7 @@ class FakeZero3Engine:
 
     @staticmethod
     def torch_autocast_enabled():
-        return True
+        return False
 
     @staticmethod
     def torch_autocast_dtype():
@@ -126,9 +125,7 @@ def test_frozen_training_argument_contract():
 
     nonreentrant = config.model_copy(
         update={
-            "train": config.train.model_copy(
-                update={"gradient_checkpointing_use_reentrant": False}
-            )
+            "train": config.train.model_copy(update={"gradient_checkpointing_use_reentrant": False})
         }
     )
     with pytest.raises(TrainingContractError, match="reentrant"):
@@ -183,43 +180,42 @@ def test_epoch_callback_rejects_eval_dataset():
         DatasetEpochCallback(dataset)
 
 
-def test_two_phase_deepspeed_precision_switch_preserves_fp32_lora():
+def test_native_bf16_precision_contract_does_not_mutate_runtime():
     config = load_config("configs/transition1x.yaml")
     arguments = build_training_arguments(config, output_dir="artifacts/runs/test")
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
 
-    load_report = assert_zero3_bf16_load_phase(arguments)
-    parameter_report = assert_bf16_base_fp32_lora_parameters(model, expected_trainable_parameters=5)
-    switch_report = activate_zero3_fp32_lora_training_phase(
+    runtime_report = assert_zero3_bf16_runtime(arguments)
+    parameter_report = assert_bf16_model_parameters(model, expected_trainable_parameters=5)
+    precision_report = assert_zero3_bf16_precision(
         arguments, model, expected_trainable_parameters=5
     )
-    runtime_report = assert_zero3_fp32_lora_training_phase(arguments)
 
-    assert load_report["native_bf16"] is True
-    assert parameter_report["adapter_dtype"] == "float32"
-    assert switch_report["training_phase"] == runtime_report
-    assert arguments.bf16 is False
-    assert arguments.mixed_precision == "no"
-    assert arguments.hf_deepspeed_config.config["bf16"]["enabled"] is False
-    assert arguments.hf_deepspeed_config.config["torch_autocast"]["enabled"] is True
+    assert runtime_report["native_bf16"] is True
+    assert parameter_report["adapter_dtype"] == "bfloat16"
+    assert precision_report["runtime"] == runtime_report
+    assert arguments.bf16 is True
+    assert arguments.mixed_precision == "bf16"
+    assert arguments.hf_deepspeed_config.config["bf16"]["enabled"] is True
+    assert arguments.hf_deepspeed_config.config["torch_autocast"]["enabled"] is False
 
 
 def test_zero3_engine_precision_gate_checks_shards_masters_and_states():
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
     report = assert_zero3_engine_precision_contract(
         FakeZero3Engine(model),
         expected_trainable_parameters=5,
         require_optimizer_states=True,
     )
 
-    assert report["adapter_shard_dtype"] == "float32"
+    assert report["adapter_shard_dtype"] == "bfloat16"
     assert report["master_dtype"] == "float32"
-    assert report["adapter_communication_dtype"] == "float32"
+    assert report["adapter_communication_dtype"] == "bfloat16"
     assert report["optimizer_state_dtype"] == "float32"
 
 
 def test_zero3_engine_precision_gate_rejects_missing_adam_state():
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
     with pytest.raises(TrainingContractError, match="state tensors"):
         assert_zero3_engine_precision_contract(
             FakeZero3Engine(model, state_initialized=False),
@@ -228,13 +224,13 @@ def test_zero3_engine_precision_gate_rejects_missing_adam_state():
         )
 
 
-def test_two_rank_dtype_gate_keeps_mixed_storage_communication_separate():
+def test_two_rank_dtype_gate_uses_native_bf16():
     gate = build_tiny_zero3_dtype_gate_config()
 
-    assert gate["bf16"]["enabled"] is False
+    assert gate["bf16"]["enabled"] is True
     assert gate["fp16"]["enabled"] is False
     assert gate["torch_autocast"] == {
-        "enabled": True,
+        "enabled": False,
         "dtype": "bfloat16",
         "lower_precision_safe_modules": [],
     }
@@ -244,7 +240,7 @@ def test_two_rank_dtype_gate_keeps_mixed_storage_communication_separate():
 
 
 def test_dtype_gate_tracks_top_level_trainable_zero3_shards_without_name_matching():
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
     for parameter in model.parameters():
         parameter.ds_tensor = parameter.detach().clone()
 
@@ -259,7 +255,7 @@ def test_dtype_gate_tracks_top_level_trainable_zero3_shards_without_name_matchin
 
 
 def test_dtype_gate_rejects_an_empty_trainable_zero3_snapshot():
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
     model.requires_grad_(False)
 
     with pytest.raises(RuntimeError, match="no trainable ZeRO shards"):
@@ -267,7 +263,7 @@ def test_dtype_gate_rejects_an_empty_trainable_zero3_snapshot():
 
 
 def test_dtype_gate_requires_the_same_trainable_shards_after_step():
-    model = TinyMixedDtypeModel()
+    model = TinyBf16Model()
     for parameter in model.parameters():
         parameter.ds_tensor = parameter.detach().clone()
     before = snapshot_trainable_zero3_shards(model)
@@ -277,14 +273,11 @@ def test_dtype_gate_requires_the_same_trainable_shards_after_step():
         measure_trainable_zero3_shard_updates(model, before)
 
 
-def test_accelerate_plugin_selects_post_switch_config_without_gpu():
+def test_accelerate_plugin_selects_native_bf16_config_without_gpu():
     from transformers.integrations.deepspeed import unset_hf_deepspeed_config
 
     config = load_config("configs/transition1x.yaml")
     arguments = build_training_arguments(config, output_dir="artifacts/runs/test")
-    activate_zero3_fp32_lora_training_phase(
-        arguments, TinyMixedDtypeModel(), expected_trainable_parameters=5
-    )
     plugin = arguments.deepspeed_plugin
     try:
         # These are the two real Accelerate calls made during AcceleratorState

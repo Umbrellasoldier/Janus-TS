@@ -53,8 +53,8 @@ from .runtime import install_frozen_environment
 from .tokenization import CausalLMCollator, EpochAwareTokenizedDataset, QwenTrainingEncoder
 from .training import (
     TokenNormalizedTrainer,
-    activate_zero3_fp32_lora_training_phase,
     assert_accelerate_zero3_precision_state,
+    assert_zero3_bf16_precision,
     assert_zero3_engine_precision_contract,
     build_epoch_callback,
     build_training_argument_kwargs,
@@ -468,7 +468,7 @@ def assert_model_precision_and_freezing(
     *,
     expected_trainable_parameters: int = EXPECTED_TRAINABLE_PARAMETERS,
 ) -> None:
-    """Check BF16 frozen base and FP32 trainable adapters under ZeRO-3."""
+    """Check BF16 frozen base and BF16 trainable adapters under ZeRO-3."""
 
     trainable = 0
     problems: list[str] = []
@@ -480,8 +480,8 @@ def assert_model_precision_and_freezing(
                 problems.append(f"frozen adapter {name}")
             else:
                 trainable += logical_numel
-            if parameter.dtype != torch_module.float32:
-                problems.append(f"non-FP32 adapter {name}: {parameter.dtype}")
+            if parameter.dtype != torch_module.bfloat16:
+                problems.append(f"non-BF16 adapter {name}: {parameter.dtype}")
         else:
             if parameter.requires_grad:
                 problems.append(f"trainable base {name}")
@@ -587,20 +587,19 @@ def load_zero3_prepared_model(
         base,
         initial_dir,
         is_trainable=True,
-        autocast_adapter_dtype=True,
+        autocast_adapter_dtype=False,
         low_cpu_mem_usage=False,
     )
     if getattr(model, "hf_device_map", None):
         raise DistributedTrainingError("PEFT load unexpectedly created a device map")
 
-    # PEFT normally performs this cast through autocast_adapter_dtype.  Repeat
-    # it explicitly before the assertion so the training dtype does not depend
-    # on an implicit PEFT default changing.
+    # The serialized PiSSA initializer is FP32. Cast it explicitly so the
+    # training dtype does not depend on PEFT loading defaults.
     for name, parameter in model.named_parameters():
         adapter = _is_lora_parameter(name)
         parameter.requires_grad_(adapter)
-        if adapter and parameter.dtype != torch_module.float32:
-            parameter.data = parameter.data.to(dtype=torch_module.float32)
+        if adapter and parameter.dtype != torch_module.bfloat16:
+            parameter.data = parameter.data.to(dtype=torch_module.bfloat16)
 
     model.config.use_cache = False
     model.config.pad_token_id = QWEN_PAD_TOKEN_ID
@@ -610,16 +609,14 @@ def load_zero3_prepared_model(
         generation_config.pad_token_id = QWEN_PAD_TOKEN_ID
         generation_config.eos_token_id = QWEN_IM_END_TOKEN_ID
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs=dict(checkpointing_kwargs)
-    )
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=dict(checkpointing_kwargs))
     model._janus_ts_input_grads_enabled = True
     model._janus_ts_reentrant_gc_enabled = True
     model.train()
     assert_pissa_adapter_contract(model)
     assert_model_precision_and_freezing(model, torch_module)
-    precision_switch = activate_zero3_fp32_lora_training_phase(arguments, model)
-    model._janus_ts_precision_switch_report = precision_switch
+    precision = assert_zero3_bf16_precision(arguments, model)
+    model._janus_ts_precision_report = precision
     return model
 
 
@@ -809,7 +806,7 @@ def run_memory_smoke(
         "sequence_length": MAX_SEQUENCE_LENGTH,
         "global_step": int(trainer.state.global_step),
         "training_loss": training_loss,
-        "precision_switch": getattr(model, "_janus_ts_precision_switch_report", None),
+        "precision": getattr(model, "_janus_ts_precision_report", None),
         "peak_allocated_mib": torch.cuda.max_memory_allocated(device) // 1024**2,
         "peak_reserved_mib": torch.cuda.max_memory_reserved(device) // 1024**2,
         "device_memory_used_mib": _local_gpu_used_mib(context.local_rank),

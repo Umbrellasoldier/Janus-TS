@@ -1,4 +1,4 @@
-"""Two-rank CUDA gate for BF16 compute with true FP32 LoRA storage.
+"""Two-rank CUDA gate for native-BF16 model storage and compute.
 
 Run this only after the host-resource gate has established exclusive access::
 
@@ -88,10 +88,10 @@ def build_tiny_zero3_dtype_gate_config() -> dict[str, Any]:
     """Return the minimal runtime config matching the full training phase."""
 
     return {
-        "bf16": {"enabled": False},
+        "bf16": {"enabled": True},
         "fp16": {"enabled": False},
         "torch_autocast": {
-            "enabled": True,
+            "enabled": False,
             "dtype": "bfloat16",
             "lower_precision_safe_modules": list(ZERO3_AUTOCAST_SAFE_MODULES),
         },
@@ -127,18 +127,17 @@ def _run_gate(output: Path) -> None:
             super().__init__()
             self.base_layer = nn.Linear(32, 32, bias=False, dtype=torch.bfloat16)
             self.lora_A = nn.ModuleDict(
-                {"default": nn.Linear(32, 4, bias=False, dtype=torch.float32)}
+                {"default": nn.Linear(32, 4, bias=False, dtype=torch.bfloat16)}
             )
             self.lora_B = nn.ModuleDict(
-                {"default": nn.Linear(4, 32, bias=False, dtype=torch.float32)}
+                {"default": nn.Linear(4, 32, bias=False, dtype=torch.bfloat16)}
             )
             self.base_layer.requires_grad_(False)
 
         def forward(self, inputs: Any) -> Any:
             residual = self.base_layer(inputs)
-            adapter_inputs = inputs.to(self.lora_A["default"].weight.dtype)
-            adapter = self.lora_B["default"](self.lora_A["default"](adapter_inputs))
-            return residual + adapter.to(residual.dtype)
+            adapter = self.lora_B["default"](self.lora_A["default"](inputs))
+            return residual + adapter
 
     install_frozen_environment()
     if not torch.cuda.is_available() or torch.cuda.device_count() != 2:
@@ -190,7 +189,7 @@ def _run_gate(output: Path) -> None:
         engine.module, before_shards
     )
     if not changed_names:
-        raise RuntimeError("the optimizer update did not change any FP32 LoRA shard")
+        raise RuntimeError("the optimizer update did not change any BF16 LoRA shard")
     if observed_output_dtypes != [str(torch.bfloat16), str(torch.bfloat16)]:
         raise RuntimeError(f"LoRA Linear compute did not use BF16: {observed_output_dtypes!r}")
 

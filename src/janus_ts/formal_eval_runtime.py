@@ -80,9 +80,9 @@ from .tokenization import (
 )
 from .training import (
     TokenNormalizedTrainer,
-    activate_zero3_fp32_lora_training_phase,
     assert_accelerate_zero3_precision_state,
-    assert_bf16_base_fp32_lora_parameters,
+    assert_bf16_model_parameters,
+    assert_zero3_bf16_precision,
     build_training_argument_kwargs,
 )
 
@@ -281,14 +281,10 @@ def _verify_portable_inventory(root: Path, manifest: Mapping[str, Any]) -> Path:
     if not adapter_root.is_dir() or adapter_root.is_symlink():
         raise FormalEvalRuntimeError(f"portable adapter directory is invalid: {adapter_root}")
     actual_entries = {
-        path.relative_to(root).as_posix()
-        for path in adapter_root.rglob("*")
-        if path.is_file()
+        path.relative_to(root).as_posix() for path in adapter_root.rglob("*") if path.is_file()
     }
     if actual_entries != _PORTABLE_FILES:
-        raise FormalEvalRuntimeError(
-            f"portable adapter files differ: {sorted(actual_entries)!r}"
-        )
+        raise FormalEvalRuntimeError(f"portable adapter files differ: {sorted(actual_entries)!r}")
     for relative in sorted(_PORTABLE_FILES):
         path = root / relative
         entry = inventory.get(relative)
@@ -346,11 +342,7 @@ def inspect_durable_checkpoint(
             f"checkpoint epoch {epoch} exceeds configured {config.train.epochs} epochs"
         )
     global_step = manifest.get("global_step")
-    if (
-        isinstance(global_step, bool)
-        or not isinstance(global_step, int)
-        or global_step <= 0
-    ):
+    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step <= 0:
         raise FormalEvalRuntimeError(f"invalid durable global_step: {global_step!r}")
     if manifest.get("world_size") != 2:
         raise FormalEvalRuntimeError("durable checkpoint was not produced by exactly two ranks")
@@ -444,9 +436,7 @@ def load_zero3_portable_model(
     portable_config_validator: Callable[[str | Path, Any], None] = (
         validate_portable_adapter_config
     ),
-    precision_activator: Callable[..., Mapping[str, Any]] = (
-        activate_zero3_fp32_lora_training_phase
-    ),
+    precision_validator: Callable[..., Mapping[str, Any]] = assert_zero3_bf16_precision,
 ) -> Any:
     """Load original BF16 Qwen + ordinary rank-64 adapter under ZeRO-Init."""
 
@@ -463,9 +453,7 @@ def load_zero3_portable_model(
     )
     if getattr(base, "hf_device_map", None):
         raise FormalEvalRuntimeError("formal ZeRO-3 base load unexpectedly created a device map")
-    portable_config_validator(
-        checkpoint.portable_adapter_path / "adapter_config.json", base.config
-    )
+    portable_config_validator(checkpoint.portable_adapter_path / "adapter_config.json", base.config)
     if adapter_loader is None:
         from peft import PeftModel
 
@@ -474,7 +462,7 @@ def load_zero3_portable_model(
         base,
         checkpoint.portable_adapter_path,
         is_trainable=True,
-        autocast_adapter_dtype=True,
+        autocast_adapter_dtype=False,
         low_cpu_mem_usage=False,
     )
     if getattr(model, "hf_device_map", None):
@@ -485,8 +473,8 @@ def load_zero3_portable_model(
     for name, parameter in model.named_parameters():
         adapter = _is_lora_parameter(name)
         parameter.requires_grad_(adapter)
-        if adapter and parameter.dtype != torch_module.float32:
-            parameter.data = parameter.data.to(dtype=torch_module.float32)
+        if adapter and parameter.dtype != torch_module.bfloat16:
+            parameter.data = parameter.data.to(dtype=torch_module.bfloat16)
     model.config.use_cache = False
     model.config.pad_token_id = QWEN_PAD_TOKEN_ID
     model.config.eos_token_id = QWEN_IM_END_TOKEN_ID
@@ -494,7 +482,7 @@ def load_zero3_portable_model(
     if generation_config is not None:
         generation_config.pad_token_id = QWEN_PAD_TOKEN_ID
         generation_config.eos_token_id = QWEN_IM_END_TOKEN_ID
-    report = precision_activator(
+    report = precision_validator(
         arguments,
         model,
         expected_trainable_parameters=EXPECTED_PORTABLE_PARAMETERS,
@@ -530,9 +518,7 @@ def prepare_formal_data(
         seed=config.seed,
     )
     eval_dataset = (
-        EpochAwareTokenizedDataset(dataset, encoder, training=False)
-        if split == "val"
-        else None
+        EpochAwareTokenizedDataset(dataset, encoder, training=False) if split == "val" else None
     )
     return PreparedFormalData(
         records=records,
@@ -561,7 +547,7 @@ def assert_formal_zero3_precision(
     *,
     expected_trainable_parameters: int = EXPECTED_PORTABLE_PARAMETERS,
 ) -> dict[str, Any]:
-    """Audit eval-only ZeRO shards and BF16 autocast without an optimizer."""
+    """Audit eval-only native-BF16 ZeRO shards without an optimizer."""
 
     import torch
     from deepspeed.runtime.torch_autocast import get_comm_dtype
@@ -570,7 +556,6 @@ def assert_formal_zero3_precision(
         "bfloat16_enabled",
         "fp16_enabled",
         "torch_autocast_enabled",
-        "torch_autocast_dtype",
         "zero_optimization_stage",
     )
     missing = [name for name in required if not callable(getattr(engine, name, None))]
@@ -578,16 +563,15 @@ def assert_formal_zero3_precision(
         raise FormalEvalRuntimeError(f"formal engine lacks DeepSpeed methods: {missing!r}")
     if (
         engine.zero_optimization_stage() != 3
-        or engine.bfloat16_enabled()
+        or not engine.bfloat16_enabled()
         or engine.fp16_enabled()
-        or not engine.torch_autocast_enabled()
-        or engine.torch_autocast_dtype() != torch.bfloat16
+        or engine.torch_autocast_enabled()
     ):
-        raise FormalEvalRuntimeError("formal engine has the wrong ZeRO/autocast precision mode")
+        raise FormalEvalRuntimeError("formal engine has the wrong native-BF16 precision mode")
     module = getattr(engine, "module", None)
     if module is None:
         raise FormalEvalRuntimeError("formal DeepSpeed engine has no module")
-    parameter_report = assert_bf16_base_fp32_lora_parameters(
+    parameter_report = assert_bf16_model_parameters(
         module,
         expected_trainable_parameters=expected_trainable_parameters,
     )
@@ -598,12 +582,11 @@ def assert_formal_zero3_precision(
         if not hasattr(parameter, "ds_id") or shard is None:
             problems.append(f"unpartitioned parameter {name}")
             continue
-        expected = torch.float32 if _is_lora_parameter(name) else torch.bfloat16
-        if parameter.is_floating_point() and shard.dtype != expected:
+        if parameter.is_floating_point() and shard.dtype != torch.bfloat16:
             problems.append(f"wrong shard dtype {name}={shard.dtype}")
         if _is_lora_parameter(name):
             communication_dtypes.add(str(get_comm_dtype(parameter)))
-    if communication_dtypes != {str(torch.float32)}:
+    if communication_dtypes != {str(torch.bfloat16)}:
         problems.append(f"LoRA communication dtypes={sorted(communication_dtypes)!r}")
     if problems:
         raise FormalEvalRuntimeError(
@@ -612,12 +595,12 @@ def assert_formal_zero3_precision(
     return {
         **parameter_report,
         "zero_stage": 3,
-        "native_bf16": False,
+        "native_bf16": True,
         "native_fp16": False,
-        "torch_autocast_dtype": "bfloat16",
+        "torch_autocast": False,
         "base_shard_dtype": "bfloat16",
-        "adapter_shard_dtype": "float32",
-        "adapter_communication_dtype": "float32",
+        "adapter_shard_dtype": "bfloat16",
+        "adapter_communication_dtype": "bfloat16",
     }
 
 
@@ -833,9 +816,7 @@ def validate_runtime_receipt(
 ) -> FormalRuntimeReceipt:
     """Strictly validate a receipt and both content-addressed result files."""
 
-    checkpoint = inspect_durable_checkpoint(
-        checkpoint_dir, processed_path, config=config
-    )
+    checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed_path, config=config)
     path = Path(receipt_path)
     payload = _load_json_object(path, description="formal runtime receipt")
     split = payload.get("split")
@@ -897,19 +878,14 @@ def load_checkpoint_score(
 ) -> CheckpointScore:
     """Load the exact @10 validation score used by checkpoint selection."""
 
-    checkpoint = inspect_durable_checkpoint(
-        checkpoint_dir, processed_path, config=config
-    )
+    checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed_path, config=config)
     metrics_source = Path(metrics_file)
     identity = checkpoint.generation_identity("val")
     if metrics_source.name != metrics_path(metrics_source.parent, identity).name:
         raise FormalEvalRuntimeError("validation metrics filename differs from its identity")
     payload = _load_metrics_payload(metrics_source, checkpoint, "val")
     predictions = merged_predictions_path(metrics_source.parent, identity)
-    if (
-        not predictions.is_file()
-        or sha256_file(predictions) != payload["predictions_sha256"]
-    ):
+    if not predictions.is_file() or sha256_file(predictions) != payload["predictions_sha256"]:
         raise FormalEvalRuntimeError("validation predictions are missing or corrupt")
     evaluation = payload["evaluation"]
     metrics_by_k = evaluation.get("metrics")
@@ -1008,9 +984,7 @@ def run_formal_checkpoint_evaluation(
     if split == "test" and selection_proof_path is None:
         raise FormalEvalRuntimeError("test requires a locked selection proof")
     environment_installer()
-    checkpoint = inspect_durable_checkpoint(
-        checkpoint_dir, processed_path, config=config
-    )
+    checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed_path, config=config)
     output_root = Path(output_dir)
     if split == "test":
         load_selection_proof(
@@ -1041,9 +1015,7 @@ def run_formal_checkpoint_evaluation(
     if split == "val":
         if prepared.eval_dataset is None:
             raise FormalEvalRuntimeError("validation has no causal-loss dataset")
-        eval_loss = trainer_eval_loss_hook(
-            trainer, eval_dataset=prepared.eval_dataset
-        )()
+        eval_loss = trainer_eval_loss_hook(trainer, eval_dataset=prepared.eval_dataset)()
     else:
         inference_initializer(trainer)
         eval_loss = None

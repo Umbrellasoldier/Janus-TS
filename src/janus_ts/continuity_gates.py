@@ -105,8 +105,8 @@ from .preprocessing import (
 from .runtime import install_frozen_environment
 from .tokenization import CausalLMCollator
 from .training import (
-    activate_zero3_fp32_lora_training_phase,
     assert_accelerate_zero3_precision_state,
+    assert_zero3_bf16_precision,
     assert_zero3_engine_precision_contract,
     build_training_argument_kwargs,
 )
@@ -989,19 +989,19 @@ def _load_zero3_resume_adapter_model(
         base,
         resume_dir,
         is_trainable=True,
-        autocast_adapter_dtype=True,
+        autocast_adapter_dtype=False,
         low_cpu_mem_usage=False,
     )
     for name, parameter in model.named_parameters():
         adapter = _is_lora_parameter(name)
         parameter.requires_grad_(adapter)
-        if adapter and parameter.dtype != torch.float32:
-            parameter.data = parameter.data.to(dtype=torch.float32)
+        if adapter and parameter.dtype != torch.bfloat16:
+            parameter.data = parameter.data.to(dtype=torch.bfloat16)
     model.config.use_cache = False
     model.config.pad_token_id = QWEN_PAD_TOKEN_ID
     model.config.eos_token_id = QWEN_IM_END_TOKEN_ID
     assert_pissa_adapter_contract(model)
-    report = activate_zero3_fp32_lora_training_phase(arguments, model)
+    report = assert_zero3_bf16_precision(arguments, model)
     model._janus_ts_parity_precision_report = report
     model.eval()
     return model

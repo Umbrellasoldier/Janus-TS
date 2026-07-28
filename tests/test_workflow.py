@@ -110,7 +110,7 @@ def _pissa_resource_report(*, scope: str, swap_growth_kib: int) -> dict[str, obj
     }
 
 
-def test_prepare_pissa_hashes_once_and_rechecks_a_resumed_stage(tmp_path: Path, monkeypatch):
+def test_prepare_pissa_reuses_a_sealed_stage_without_rehashing_payload(tmp_path: Path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     (bundle / "manifest.json").write_text('{"artifact_type":"pissa"}\n', encoding="utf-8")
@@ -130,11 +130,10 @@ def test_prepare_pissa_hashes_once_and_rechecks_a_resumed_stage(tmp_path: Path, 
         nonlocal calls
         calls += 1
         assert kwargs["local_cache_root"] == tmp_path / "cache"
-        scope = "full_serialization" if calls == 1 else "cached_payload_verification"
         return {
             "files_sha256": "a" * 64,
             "preparation_resources": _pissa_resource_report(
-                scope=scope,
+                scope="full_serialization",
                 swap_growth_kib=calls * 1024,
             ),
         }
@@ -146,7 +145,7 @@ def test_prepare_pissa_hashes_once_and_rechecks_a_resumed_stage(tmp_path: Path, 
     second_bundle, second = workflow._prepare_pissa(cpu, tmp_path / "gates")
 
     assert first_bundle == second_bundle == bundle
-    assert calls == 2
+    assert calls == 1
     assert second == first
     assert first["observed_swap_growth_kib"] == 1024
     assert first["preparation_resources"]["scope"] == "full_serialization"
@@ -215,9 +214,7 @@ def test_delegated_failure_classification_and_gate_timeout(monkeypatch):
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
     with pytest.raises(workflow.WorkflowError, match="explicit 10s"):
-        workflow.run_delegated_command(
-            "gate", ("/bin/false",), runner=timeout, timeout_seconds=10
-        )
+        workflow.run_delegated_command("gate", ("/bin/false",), runner=timeout, timeout_seconds=10)
 
 
 def test_locked_gpu_phase_checks_host_before_and_after(tmp_path: Path, monkeypatch):
@@ -246,9 +243,7 @@ def test_locked_gpu_phase_checks_host_before_and_after(tmp_path: Path, monkeypat
 
 
 def test_default_delegation_uses_an_owned_process_group():
-    outcome = workflow.run_delegated_command(
-        "owned", ("/bin/true",), timeout_seconds=5
-    )
+    outcome = workflow.run_delegated_command("owned", ("/bin/true",), timeout_seconds=5)
     assert outcome.returncode == 0
 
 
@@ -329,11 +324,14 @@ def test_candidate_rejection_report_falls_back_even_if_torchrun_wraps_exit(tmp_p
     )
     assert selected is False
     assert evidence["decision"] == "fallback-to-micro1"
-    assert workflow.load_stage(
-        prepared.gate_root / "05-smoke-candidate2",
-        stage="smoke-candidate2",
-        fingerprint=prepared.run_identity.fingerprint,
-    ) == evidence
+    assert (
+        workflow.load_stage(
+            prepared.gate_root / "05-smoke-candidate2",
+            stage="smoke-candidate2",
+            fingerprint=prepared.run_identity.fingerprint,
+        )
+        == evidence
+    )
 
 
 def test_unbound_candidate_failure_is_permanent(tmp_path, monkeypatch):
@@ -579,18 +577,14 @@ def test_epoch_enumeration_uses_manifest_epoch_and_step_not_mtime(tmp_path):
     assert [item.global_step for item in values] == [100, 200, 300, 400, 500]
 
 
-def test_complete_epoch_set_repairs_training_handoff_without_gpu(
-    tmp_path, monkeypatch
-):
+def test_complete_epoch_set_repairs_training_handoff_without_gpu(tmp_path, monkeypatch):
     prepared = _prepared(tmp_path)
     initialize_run(prepared.paths, prepared.run_identity)
     prepared.paths.durable_checkpoints.mkdir(parents=True)
     for epoch in range(1, 6):
         checkpoint = prepared.paths.durable_checkpoints / f"epoch-{epoch}"
         (checkpoint / "portable_adapter").mkdir(parents=True)
-        (checkpoint / "portable_adapter" / "adapter_model.safetensors").write_bytes(
-            b"portable"
-        )
+        (checkpoint / "portable_adapter" / "adapter_model.safetensors").write_bytes(b"portable")
         mark_complete(
             checkpoint,
             {
@@ -610,9 +604,7 @@ def test_complete_epoch_set_repairs_training_handoff_without_gpu(
     checkpoints = workflow.run_training_phase(prepared)
 
     assert [item.epoch for item in checkpoints] == [1, 2, 3, 4, 5]
-    state = json.loads(
-        (prepared.paths.project / "state.json").read_text(encoding="utf-8")
-    )
+    state = json.loads((prepared.paths.project / "state.json").read_text(encoding="utf-8"))
     assert state["stage"] == "validation"
     assert state["global_step"] == 500
     evidence = workflow.load_stage(
@@ -624,9 +616,7 @@ def test_complete_epoch_set_repairs_training_handoff_without_gpu(
     assert [item["epoch"] for item in evidence["epochs"]] == [1, 2, 3, 4, 5]
 
 
-def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(
-    tmp_path, monkeypatch
-):
+def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monkeypatch):
     import janus_ts.evaluation as evaluation_module
     import janus_ts.formal_eval_runtime as formal_runtime
 
@@ -714,9 +704,7 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(
         "formal-val-epoch-5",
         "formal-test-epoch-3",
     ]
-    state = json.loads(
-        (prepared.paths.project / "state.json").read_text(encoding="utf-8")
-    )
+    state = json.loads((prepared.paths.project / "state.json").read_text(encoding="utf-8"))
     assert state["stage"] == "complete"
     assert state["selected_epoch"] == 3
     assert state["test_evaluated"] is True
@@ -740,9 +728,7 @@ def test_checkpoint_callback_factory_is_late_bound(tmp_path):
         factory(lambda: object())
 
 
-def test_rank_zero_jsonl_log_is_fsynced_and_restart_ordinals_are_explicit(
-    tmp_path, monkeypatch
-):
+def test_rank_zero_jsonl_log_is_fsynced_and_restart_ordinals_are_explicit(tmp_path, monkeypatch):
     monkeypatch.setenv("RANK", "0")
     path = tmp_path / "logs" / "train.jsonl"
     state = SimpleNamespace(global_step=10, epoch=0.5, is_world_process_zero=True)
@@ -767,9 +753,7 @@ def test_rank_zero_jsonl_log_is_fsynced_and_restart_ordinals_are_explicit(
     assert [row["global_step"] for row in rows] == [10, 10]
 
 
-def test_rank_zero_jsonl_recovers_only_an_unterminated_final_record(
-    tmp_path, monkeypatch
-):
+def test_rank_zero_jsonl_recovers_only_an_unterminated_final_record(tmp_path, monkeypatch):
     monkeypatch.setenv("RANK", "0")
     path = tmp_path / "train.jsonl"
     complete = {
