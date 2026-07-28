@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,68 @@ def _swap_used_kib() -> int:
     return values["SwapTotal"] - values["SwapFree"]
 
 
+class _PissaLoraOutputProbe:
+    """Prove that PiSSA A/B linears follow the training BF16 compute path."""
+
+    def __init__(self, model: Any) -> None:
+        self._model = model
+        self._handles: list[Any] = []
+        self._observed: dict[str, tuple[str, Any]] = {}
+
+    @staticmethod
+    def _label(name: str) -> str | None:
+        if ".lora_A." in name or name.startswith("lora_A."):
+            return "lora_A"
+        if ".lora_B." in name or name.startswith("lora_B."):
+            return "lora_B"
+        return None
+
+    def start(self) -> None:
+        selected: dict[str, tuple[str, Any]] = {}
+        for name, child in self._model.named_modules():
+            label = self._label(name)
+            if label is not None and label not in selected:
+                selected[label] = (name, child)
+            if set(selected) == {"lora_A", "lora_B"}:
+                break
+        if set(selected) != {"lora_A", "lora_B"}:
+            raise GateError("cannot locate PiSSA LoRA A/B modules for BF16 compute probe")
+
+        def hook(label: str, name: str) -> Callable[..., None]:
+            def record(_module: Any, _inputs: Any, output: Any) -> None:
+                value = output[0] if isinstance(output, (tuple, list)) and output else output
+                self._observed[label] = (name, getattr(value, "dtype", None))
+
+            return record
+
+        for label, (name, child) in selected.items():
+            self._handles.append(child.register_forward_hook(hook(label, name)))
+
+    def abort(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+
+    def finish(self) -> dict[str, str]:
+        import torch
+
+        self.abort()
+        evidence: dict[str, str] = {}
+        problems: list[str] = []
+        for label in ("lora_A", "lora_B"):
+            observed = self._observed.get(label)
+            if observed is None:
+                problems.append(f"{label} forward hook did not fire")
+                continue
+            name, dtype = observed
+            evidence[label] = str(dtype)
+            if dtype != torch.bfloat16:
+                problems.append(f"{name} output dtype={dtype}")
+        if problems:
+            raise GateError("PiSSA adapter did not compute in BF16: " + "; ".join(problems))
+        return evidence
+
+
 class PissaParityProbe:
     """Three-stage untouched/PiSSA/reload logit comparison.
 
@@ -67,14 +130,38 @@ class PissaParityProbe:
             "attention_mask": self._attention_mask.to(device),
         }
         model.eval()
-        with torch.inference_mode():
-            logits = model(**inputs, use_cache=False).logits[:, -1, :].float().cpu()
+        adapter_probe = None if stage == "original_base" else _PissaLoraOutputProbe(model)
+        if adapter_probe is not None:
+            adapter_probe.start()
+        try:
+            # DeepSpeed owns an equivalent explicit BF16 autocast context in
+            # training and formal evaluation.  PiSSA A/B parameters remain
+            # FP32 for optimizer state, but their matrix multiplies must be
+            # evaluated in BF16 when comparing the reconstructed model with
+            # the untouched BF16 checkpoint.
+            with torch.inference_mode(), torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+            ):
+                output = model(**inputs, use_cache=False)
+        except BaseException:
+            if adapter_probe is not None:
+                adapter_probe.abort()
+            raise
+        lora_output_dtypes = None if adapter_probe is None else adapter_probe.finish()
+        output_dtype = str(output.logits.dtype)
+        logits = output.logits[:, -1, :].float().cpu()
         result: dict[str, Any] = {
             "stage": stage,
             "tokens": int(self._input_ids.shape[1]),
             "argmax": int(logits.argmax()),
             "finite": bool(torch.isfinite(logits).all()),
+            "autocast_device_type": device.type,
+            "autocast_dtype": str(torch.bfloat16),
+            "logits_dtype_before_cpu_cast": output_dtype,
         }
+        if lora_output_dtypes is not None:
+            result["lora_output_dtypes"] = lora_output_dtypes
         if not result["finite"]:
             raise GateError(f"non-finite PiSSA probe logits at {stage}")
         if stage == "original_base":
