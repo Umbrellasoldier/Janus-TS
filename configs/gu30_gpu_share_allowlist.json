@@ -1,0 +1,77 @@
+{
+  "schema_version": "janus-ts-external-gpu-allowlist-v1",
+  "entries": [
+    {
+      "pid": 1359466,
+      "start_time_ticks": 105249381,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-fab6dd66-c6f3-c516-11f5-374f6c4753e6",
+      "cmdline_sha256": "00e85c6c7170065696249307d6f643ffec9261a9c628add7352e9f54652548aa"
+    },
+    {
+      "pid": 1359467,
+      "start_time_ticks": 105249382,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-fab6dd66-c6f3-c516-11f5-374f6c4753e6",
+      "cmdline_sha256": "00e85c6c7170065696249307d6f643ffec9261a9c628add7352e9f54652548aa"
+    },
+    {
+      "pid": 1359468,
+      "start_time_ticks": 105249383,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-fab6dd66-c6f3-c516-11f5-374f6c4753e6",
+      "cmdline_sha256": "00e85c6c7170065696249307d6f643ffec9261a9c628add7352e9f54652548aa"
+    },
+    {
+      "pid": 1359469,
+      "start_time_ticks": 105249383,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-fab6dd66-c6f3-c516-11f5-374f6c4753e6",
+      "cmdline_sha256": "00e85c6c7170065696249307d6f643ffec9261a9c628add7352e9f54652548aa"
+    },
+    {
+      "pid": 1376626,
+      "start_time_ticks": 105489324,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-57941655-a198-e1e9-01f1-b3685bf95a08",
+      "cmdline_sha256": "923be930b59327e105eeaf32854533f8b3cf272be0439ac7dd434dfba12cb226"
+    },
+    {
+      "pid": 1376627,
+      "start_time_ticks": 105489324,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-57941655-a198-e1e9-01f1-b3685bf95a08",
+      "cmdline_sha256": "923be930b59327e105eeaf32854533f8b3cf272be0439ac7dd434dfba12cb226"
+    },
+    {
+      "pid": 1376628,
+      "start_time_ticks": 105489324,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-57941655-a198-e1e9-01f1-b3685bf95a08",
+      "cmdline_sha256": "923be930b59327e105eeaf32854533f8b3cf272be0439ac7dd434dfba12cb226"
+    },
+    {
+      "pid": 1376629,
+      "start_time_ticks": 105489324,
+      "uid": 1050,
+      "executable_path": "/opt/lammps-23jun22/bin/lmp",
+      "process_name": "lmp",
+      "gpu_uuid": "GPU-57941655-a198-e1e9-01f1-b3685bf95a08",
+      "cmdline_sha256": "923be930b59327e105eeaf32854533f8b3cf272be0439ac7dd434dfba12cb226"
+    }
+  ]
+}

@@ -24,10 +24,15 @@ uv run janus-ts infer thinking --help
 `train smoke` performs the CPU/data/snapshot/native audits, the two-rank CUDA
 kernel and dtype gates, immutable PiSSA preparation, microbatch-1 and optional
 microbatch-2 memory smokes, and an interruption/resume continuity test. Each
-GPU phase takes the dedicated gu30 lock and refuses to compete with a foreign
-compute process. Candidate microbatch 2 is selected only from a passing
-44-GiB/256-MiB receipt; a content-verified candidate rejection falls back to
-the single frozen default rather than starting a parameter search.
+GPU phase takes the dedicated gu30 lock and normally refuses to compete with a
+foreign compute process. For this Transition1x workflow only, the eight
+LAMMPS process identities captured before launch form a fixed, non-expanding
+sharing allowlist; every new or unbound GPU process still blocks. The workflow
+never signals or kills those jobs. Candidate microbatch 2 is selected only
+from a receipt whose whole-device peak is at most 45,056 MiB per GPU, including
+LAMMPS usage, and whose swap growth is at most 256 MiB. A content-verified
+candidate rejection falls back to the single frozen default rather than
+starting a parameter search.
 
 `train run` repeats or verifies those content-addressed gates, resumes the
 greatest valid local/durable manifest step, and trains to five durable epochs.

@@ -13,6 +13,7 @@ from .modeling import (
 )
 from .native_stack import audit_native_stack
 from .runtime import (
+    approved_external_gpu_pids,
     assert_host_ready,
     descendant_pids,
     exclusive_lock,
@@ -145,7 +146,10 @@ def prepare_pissa_gate(
     if destination.exists():
         return verify_bundle_payload(destination)
     with exclusive_lock(gpu_lock_path):
-        before = assert_host_ready(allowed_pids=tuple(descendant_pids()))
+        allowed = tuple(
+            sorted(set(descendant_pids()) | set(approved_external_gpu_pids()))
+        )
+        before = assert_host_ready(allowed_pids=allowed)
         native = audit_native_stack()
         snapshot = audit_snapshot(cache_dir=hub_cache_dir)
         from transformers import AutoTokenizer

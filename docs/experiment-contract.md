@@ -191,9 +191,20 @@ the same metrics. Frozen v24 prediction SHA256:
 
 ## Persistence and host safety
 
-Training starts only when both GPUs have no foreign compute process and
-`MemAvailable >= 16 GiB`; it never kills another user's process. The launcher
-sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
+The default policy is to start GPU work only when both GPUs have no foreign
+compute process.  The explicitly confirmed one-time exception for this
+Transition1x workflow permits only the eight LAMMPS processes whose full
+process identities were captured before the shared launch.  Any new,
+restarted, PID-reused, or otherwise unbound GPU process blocks the next GPU
+phase; the allowlist cannot grow, although it may shrink as an original
+process exits.  The workflow never signals or kills any of these processes or
+any other user's process.
+
+Sharing does not relax either resource gate: `MemAvailable >= 16 GiB`, host
+swap growth `<= 256 MiB`, and the `45,056 MiB` per-GPU peak limit remain in
+force.  The GPU peak is measured as whole-device memory usage, including the
+allowed LAMMPS allocation, rather than as Janus-TS process memory alone.  The
+launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, and
 `DS_BUILD_OPS=0`; `CPATH` points only to the pinned build environment's Python
 3.11 headers. A tagged tmux supervisor plus a preserving `@reboot` crontab

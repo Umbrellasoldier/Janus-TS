@@ -148,6 +148,7 @@ def test_locked_gpu_phase_checks_before_and_after_without_killing(tmp_path: Path
     monkeypatch.setattr(workflow, "exclusive_lock", lock)
     monkeypatch.setattr(workflow, "assert_host_ready", gate)
     monkeypatch.setattr(workflow, "descendant_pids", lambda: {10, 11})
+    monkeypatch.setattr(workflow, "approved_external_gpu_pids", lambda: (20, 21))
     outcome = workflow.run_locked_gpu_command(
         "phase",
         ("/bin/true",),
@@ -155,8 +156,8 @@ def test_locked_gpu_phase_checks_before_and_after_without_killing(tmp_path: Path
         runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0),
     )
     assert outcome.returncode == 0
-    assert events[1] == ("gate", (10, 11))
-    assert events[2] == ("gate", (os.getpid(),))
+    assert events[1] == ("gate", (10, 11, 20, 21))
+    assert events[2] == ("gate", tuple(sorted((os.getpid(), 20, 21))))
 
 
 def test_default_delegation_uses_an_owned_process_group():

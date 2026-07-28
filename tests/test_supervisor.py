@@ -114,6 +114,7 @@ def test_host_gate_only_waits_and_never_signals_processes(tmp_path: Path, monkey
         calls += 1
         assert kwargs["required_gpu_count"] == 2
         assert kwargs["minimum_mem_available_kib"] == 16 * 1024 * 1024
+        assert {456, 789}.issubset(kwargs["allowed_pids"])
         if calls == 1:
             raise ResourceUnavailableError("foreign pid=123")
         return object()
@@ -122,6 +123,7 @@ def test_host_gate_only_waits_and_never_signals_processes(tmp_path: Path, monkey
         raise AssertionError("the supervisor must never kill a GPU process")
 
     monkeypatch.setattr(supervisor.os, "kill", forbidden_kill)
+    monkeypatch.setattr(supervisor, "approved_external_gpu_pids", lambda: (456, 789))
     supervisor.wait_for_host_resources(spec, gate=gate, sleep=sleeps.append)
     assert calls == 2
     assert sleeps == [2]
