@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "janus-ts"
+version = "0.1.0"
+description = "MoleCode-TS transition-state graph prediction with Qwen"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "accelerate==1.13.0",
+  "datasets==4.8.4",
+  "deepspeed==0.19.2",
+  "flash-linear-attention==0.5.0",
+  "h5py==3.16.0",
+  "huggingface-hub==1.15.0",
+  "jinja2==3.1.6",
+  "numpy==2.4.2",
+  "peft==0.19.1",
+  "psutil==7.2.2",
+  "pyarrow==24.0.0",
+  "pydantic==2.12.5",
+  "pyyaml==6.0.3",
+  "rdkit==2026.3.1",
+  "rich==14.3.3",
+  "safetensors==0.7.0",
+  "scipy==1.17.0",
+  "tensorboard==2.20.0",
+  "tokenizers==0.22.2",
+  "torch==2.9.1",
+  "transformers==5.9.0",
+  "typer==0.21.0",
+  "causal-conv1d @ file:///home/caoxiangyu/.cache/janus-ts/wheels/causal_conv1d-1.6.2.post1%2Bcu128torch2.9cxx11abitrueglibc228-cp311-cp311-linux_x86_64.whl",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.2",
+  "pytest-cov==7.0.0",
+  "ruff==0.14.10",
+]
+
+[project.scripts]
+janus-ts = "janus_ts.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["artifacts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

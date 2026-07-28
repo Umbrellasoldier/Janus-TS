@@ -1,0 +1,96 @@
+experiment: transition1x_qwen3_6_27b_molecode_ts_v1
+seed: 42
+
+data:
+  name: transition1x
+  raw_dir: "/mnt/sto3/shared_files/lgh to cxy/GeoDiff/training_data/reaction_data/train_addprop_wbo_raw_energy_kcalmol_split_8_1_1_rxn9233_test"
+  h5_path: "/mnt/sto3/caoxiangyu/Transition1x.h5"
+  recovery_jsonl: "/home/caoxiangyu/.cache/janus-ts/sources/chemformer_bo_recovery/ts1x_smiles_hybrid.jsonl"
+  processed_root: "artifacts/data/processed"
+  expected_source_sha256:
+    train.pkl: 2e879027934286f2ecf38a7807662f9ee7777c45f2b0af8f552083fc1c601686
+    val.pkl: 39283bfa484b3c68a2138634a39ba91770f1b020349663066ba279004d47ada1
+    test.pkl: 3c24fe33dacf38235f51dd01eb8c17aae2963f04294e060c08746cf99ef27e86
+    recovery.jsonl: 5843fc724f4a0dff9b624617c383ed81532191e1de8bfaf21570e26ac9cf54ad
+  expected_raw_counts: {train: 7968, val: 996, test: 996}
+  expected_retained_counts: {train: 7954, val: 994, test: 996}
+  min_ts_edge_weight: 0.1
+  signature_algorithm: rdkit-canonical-isomeric-mapless-directional-v1
+  keep_in_memory: false
+  dataloader_workers: 0
+  pin_memory: true
+
+model:
+  model_id: Qwen/Qwen3.6-27B
+  revision: 6a9e13bd6fc8f0983b9b99948120bc37f49c13e9
+  cache_dir: /home/caoxiangyu/.cache/huggingface
+  dtype: bfloat16
+  max_sequence_length: 2048
+  pad_token_id: 248044
+  im_start_token_id: 248045
+  eos_token_id: 248046
+
+adapter:
+  rank: 32
+  alpha: 16
+  dropout: 0.0
+  bias: none
+  use_rslora: true
+  init_lora_weights: pissa_niter_16
+  expected_target_modules: 496
+  expected_trainable_parameters: 233455616
+  expected_portable_rank: 64
+  expected_portable_parameters: 466911232
+
+train:
+  epochs: 5
+  learning_rate: 0.0001
+  betas: [0.9, 0.999]
+  epsilon: 0.00000001
+  weight_decay: 0.0
+  scheduler: cosine
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  micro_batch_size_per_gpu: 1
+  gradient_accumulation_steps: 8
+  candidate_micro_batch_size_per_gpu: 2
+  candidate_gradient_accumulation_steps: 4
+  global_batch_size: 16
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+  average_tokens_across_devices: true
+  checkpoint_steps: 50
+  keep_local_checkpoints: 2
+  log_steps: 10
+  deepspeed_config: configs/deepspeed_zero3.json
+
+generation:
+  enable_thinking: false
+  num_beams: 10
+  num_return_sequences: 10
+  do_sample: false
+  max_new_tokens: 512
+  length_penalty: 1.0
+  early_stopping: false
+  report_k: [1, 2, 3, 4, 5, 10]
+
+thinking_generation:
+  enable_thinking: true
+  num_beams: 1
+  num_return_sequences: 1
+  do_sample: true
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  min_p: 0.0
+  presence_penalty: 0.0
+  repetition_penalty: 1.0
+  max_new_tokens: 8192
+
+runtime:
+  artifacts_root: artifacts
+  local_cache_root: /home/caoxiangyu/.cache/janus-ts
+  gpu_lock_path: /home/caoxiangyu/.cache/janus-ts/locks/gu30-gpu0-1.lock
+  required_gpu_count: 2
+  max_gpu_peak_mib: 45056
+  retry_delays_minutes: [1, 5, 15]

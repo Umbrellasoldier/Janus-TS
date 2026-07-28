@@ -1,0 +1,76 @@
+# Janus-TS
+
+`Janus-TS` fine-tunes a pinned Qwen text model to predict a discretized
+transition-state molecular graph from reactant and product molecular graphs.
+
+The first locked experiment is Transition1x with the `MoleCode-TS/v1` text
+representation. Raw chemistry datasets and the historical `chemformer_bo`
+checkout are read-only inputs; generated data and run artifacts live below
+`artifacts/` and are intentionally excluded from Git.
+
+## Commands
+
+```bash
+uv sync --frozen
+uv run janus-ts --help
+uv run janus-ts data preprocess --config configs/transition1x.yaml
+uv run janus-ts data audit --config configs/transition1x.yaml
+uv run janus-ts train smoke --config configs/transition1x.yaml
+uv run janus-ts train run --config configs/transition1x.yaml
+uv run janus-ts evaluate run --config configs/transition1x.yaml
+uv run janus-ts infer thinking --help
+```
+
+`train smoke` performs the CPU/data/snapshot/native audits, the two-rank CUDA
+kernel and dtype gates, immutable PiSSA preparation, microbatch-1 and optional
+microbatch-2 memory smokes, and an interruption/resume continuity test. Each
+GPU phase takes the dedicated gu30 lock and refuses to compete with a foreign
+compute process. Candidate microbatch 2 is selected only from a passing
+44-GiB/256-MiB receipt; a content-verified candidate rejection falls back to
+the single frozen default rather than starting a parameter search.
+
+`train run` repeats or verifies those content-addressed gates, resumes the
+greatest valid local/durable manifest step, and trains to five durable epochs.
+It then checks each epoch's rank-64 portable adapter against its rank-32 resume
+form before formal validation. Epoch 1 also gates the real longest-prompt
+beam-10 formal generation path and a separate forced-full-512-token memory
+stress decode. The workflow then locks the @10 lexicographic winner, evaluates
+the test split once, and writes the exact 102-reaction v24 comparison.
+Checkpoint and stage ordering use fingerprints, explicit global steps, and
+completion markers only—never filesystem modification time. Trainer events
+are appended and fsynced to the run's `logs/train.jsonl` every configured ten
+steps in addition to TensorBoard output.
+
+## Optional thinking-mode exploration
+
+Thinking-mode inference is an explicitly non-formal inspection tool. Supply
+the processed dataset and the selected durable epoch checkpoint directly; the
+selection proof contains content fingerprints but does not contain enough path
+information to resolve either directory safely.
+
+```bash
+uv run janus-ts infer thinking \
+  --config configs/transition1x.yaml \
+  --processed-path /absolute/path/to/processed/transition1x/FINGERPRINT \
+  --checkpoint-dir /absolute/path/to/selected/epoch-checkpoint \
+  --output-dir artifacts/exploration \
+  --split val \
+  --reaction-id rxn0001 \
+  --reaction-id rxn0002
+```
+
+The launcher uses the project's absolute `torchrun`, takes the same exclusive
+gu30 GPU lock, and repeats the foreign-process and host-readiness checks before
+and after the two-rank job. Without `--reaction-id` it inspects only the first
+two records by default; `--limit` changes that finite selection. An odd number
+of selected records adds one deterministic dummy `generate` call so both
+ZeRO-3 ranks execute the same number of collectives, but the dummy is never
+written as a prediction.
+
+The frozen exploratory profile enables thinking and sampling with beam 1,
+temperature 0.6, top-p 0.95, top-k 20, min-p 0, repetition penalty 1, and up
+to 8192 new tokens. `presence_penalty=0` is recorded in provenance only and is
+not passed to Transformers. Results are content-addressed below
+`OUTPUT_DIR/thinking-exploratory/` and are marked `formal_eligible=false`.
+They do not compute formal metrics, alter checkpoint selection or run state,
+or acquire the one-time formal test lease.

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PROJECT_ROOT="/mnt/sto3/caoxiangyu/Janus-TS"
+readonly PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+
+exec "${PYTHON}" -m janus_ts.supervisor "$@"

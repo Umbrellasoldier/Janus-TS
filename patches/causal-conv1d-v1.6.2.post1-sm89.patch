@@ -1,0 +1,34 @@
+diff --git a/setup.py b/setup.py
+index 0029359..36a2e41 100644
+--- a/setup.py
++++ b/setup.py
+@@ -144,25 +144,9 @@ if not SKIP_CUDA_BUILD:
+                 )
+
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_75,code=sm_75")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_80,code=sm_80")
+-        cc_flag.append("-gencode")
+-        cc_flag.append("arch=compute_87,code=sm_87")
+-        if bare_metal_version >= Version("11.8"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_90,code=sm_90")
+-        if bare_metal_version >= Version("12.8"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_100,code=sm_100")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_120,code=sm_120")
+-        if bare_metal_version >= Version("13.0"):
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_103,code=sm_103")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_110,code=sm_110")
+-            cc_flag.append("-gencode")
+-            cc_flag.append("arch=compute_121,code=sm_121")
++        # Janus-TS is pinned to RTX 4090 (Ada, SM 8.9).  Building only the
++        # deployed architecture also keeps the locally reproducible wheel
++        # compact enough for the project uv environment.
++        cc_flag.extend(["-gencode", "arch=compute_89,code=sm_89"])
+
+     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
