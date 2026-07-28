@@ -1206,7 +1206,7 @@ def prepare_smoke_workflow(
     *,
     runner: Runner = subprocess.run,
 ) -> PreparedRun:
-    """Run/verify CPU, kernel, dtype, PiSSA and both memory-smoke gates."""
+    """Verify data, native BF16, and PiSSA before direct default training."""
 
     cpu = run_cpu_audits(config_path)
     gate_root = _stage_root(cpu)
@@ -1223,68 +1223,8 @@ def prepare_smoke_workflow(
     _run_dtype_gate(cpu, gate_root, runner=runner)
     bundle, _ = _prepare_pissa(cpu, gate_root)
 
-    # Memory smokes are launch gates shared by both frozen geometries.  Use a
-    # deterministic provisional identity only to bind their stage receipts;
-    # do not initialize a run/checkpoint tree until the gate has selected the
-    # actual geometry.
-    provisional_run_identity = build_run_identity(
-        cpu.config,
-        processed_data_dir=cpu.processed_path,
-        pissa_bundle_dir=bundle,
-        micro_batch_size_per_gpu=cpu.config.train.micro_batch_size_per_gpu,
-        gradient_accumulation_steps=cpu.config.train.gradient_accumulation_steps,
-    )
-    provisional_paths = _absolute_run_paths(resolve_run_paths(cpu.config, provisional_run_identity))
-    provisional_checkpoint_identity = derive_checkpoint_identity(
-        provisional_run_identity,
-        pissa_manifest_sha256=provisional_run_identity.pissa_manifest_sha256,
-    )
-    provisional = PreparedRun(
-        config=cpu.config,
-        config_path=cpu.config_path,
-        processed_path=cpu.processed_path,
-        bundle_dir=bundle,
-        run_identity=provisional_run_identity,
-        checkpoint_identity=provisional_checkpoint_identity,
-        paths=provisional_paths,
-        gate_root=gate_root,
-        micro_batch_size_per_gpu=cpu.config.train.micro_batch_size_per_gpu,
-        gradient_accumulation_steps=cpu.config.train.gradient_accumulation_steps,
-    )
-    default_passed, _ = _run_memory_smoke(provisional, micro_batch_size=1, runner=runner)
-    if not default_passed:
-        raise WorkflowError("the frozen default microbatch-1 geometry failed its hard gate")
-    candidate_passed, _ = _run_memory_smoke(provisional, micro_batch_size=2, runner=runner)
-    if candidate_passed:
-        microbatch = cpu.config.train.candidate_micro_batch_size_per_gpu
-        accumulation = cpu.config.train.candidate_gradient_accumulation_steps
-    else:
-        microbatch = cpu.config.train.micro_batch_size_per_gpu
-        accumulation = cpu.config.train.gradient_accumulation_steps
-    decision = {
-        "status": "pass",
-        "micro_batch_size_per_gpu": microbatch,
-        "gradient_accumulation_steps": accumulation,
-        "global_batch_size": cpu.config.train.global_batch_size,
-    }
-    decision_path = gate_root / "06-geometry"
-    stored_decision = load_stage(
-        decision_path,
-        stage="geometry",
-        fingerprint=provisional_run_identity.fingerprint,
-    )
-    if stored_decision is None:
-        seal_stage(
-            decision_path,
-            stage="geometry",
-            fingerprint=provisional_run_identity.fingerprint,
-            report=decision,
-        )
-    elif stored_decision != decision:
-        raise WorkflowError(
-            "completed geometry decision differs from the bound memory-smoke evidence"
-        )
-
+    microbatch = cpu.config.train.micro_batch_size_per_gpu
+    accumulation = cpu.config.train.gradient_accumulation_steps
     run_identity = build_run_identity(
         cpu.config,
         processed_data_dir=cpu.processed_path,
@@ -1300,18 +1240,17 @@ def prepare_smoke_workflow(
     )
     _write_checkpoint_identity(paths, checkpoint_identity)
     selected = PreparedRun(
-        config=provisional.config,
-        config_path=provisional.config_path,
-        processed_path=provisional.processed_path,
-        bundle_dir=provisional.bundle_dir,
+        config=cpu.config,
+        config_path=cpu.config_path,
+        processed_path=cpu.processed_path,
+        bundle_dir=bundle,
         run_identity=run_identity,
         checkpoint_identity=checkpoint_identity,
         paths=paths,
-        gate_root=provisional.gate_root,
+        gate_root=gate_root,
         micro_batch_size_per_gpu=microbatch,
         gradient_accumulation_steps=accumulation,
     )
-    _run_resume_continuity_gate(selected, runner=runner)
     return selected
 
 

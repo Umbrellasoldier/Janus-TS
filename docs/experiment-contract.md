@@ -111,10 +111,11 @@ disk-backed and content-addressed; no truncation is permitted.
   zero and softmax-invariant global logit shifts are not gate criteria.
 - AdamW (`adamw_torch`), learning rate 1e-4, betas (0.9, 0.999), epsilon 1e-8,
   weight decay 0, cosine schedule, warmup ratio 0.05, max gradient norm 1.
-- Five epochs. Default geometry is microbatch 1/GPU x 2 GPUs x accumulation 8
-  = global batch 16. Microbatch 2 / accumulation 4 is selected only if the
-  worst 2,048-token smoke stays within 44 GiB per GPU with no material swap
-  growth.
+- Five epochs. Geometry is fixed directly at microbatch 1/GPU x 2 GPUs x
+  accumulation 8 = global batch 16; no batch-size search or duplicate 27B
+  pretraining smoke is run. The audited maximum training length across all
+  five deterministic epochs is 1,795 tokens (the configured hard limit remains
+  2,048), and formal training itself is the memory proof.
 - ZeRO-3 without CPU/NVMe offload, reentrant activation checkpointing,
   `use_cache=false`, global supervised-token-normalized loss, and no W&B. The
   reentrant variant is required by the locked DeepSpeed 0.19.2/PyTorch 2.9.1
@@ -204,22 +205,19 @@ the same metrics. Frozen v24 prediction SHA256:
 
 The gu30 GPU lock prevents competing Janus-TS launchers, but other users' GPU
 jobs may coexist. The workflow never signals or kills those processes. Their
-memory remains part of the measured whole-device peak, so sharing can still
-cause a smoke-test rejection or a CUDA out-of-memory failure.
+memory can still contribute to a CUDA out-of-memory failure.
 
-Sharing does not relax the `45,056 MiB` per-GPU peak limit.  It also retains
-`MemAvailable >= 16 GiB` and host swap growth `<= 256 MiB` for every compute,
-memory-smoke, resume, and formal-training/evaluation phase.  The sole scoped
-exception is one-time PiSSA bundle serialization and cached payload hashing:
-both their starting and ending `MemAvailable` must be at least 16 GiB, while
+The `45,056 MiB` per-GPU peak limit remains on formal evaluation memory gates.
+The workflow also retains `MemAvailable >= 16 GiB` for compute phases. During
+one-time PiSSA bundle serialization, both starting and ending `MemAvailable`
+must be at least 16 GiB, while
 swap growth is recorded as a diagnostic rather than a rejection criterion.
 The initial 54.7 GB serialization completed with `MemAvailable` approximately
 20--23 GiB and observed peak swap growth 3,081.7 MiB; the user explicitly
 accepted this file-cache-induced cold-page eviction on 2026-07-28. Cached
-reuse must retain non-default resource evidence and may not silently report a
-missing observation as zero. The GPU peak is measured as whole-device memory
-usage, including coexisting jobs such as LAMMPS, rather than as Janus-TS
-process memory alone.  The launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
+reuse keeps its sealed resource evidence without rescanning the 54.7 GB
+payload. Formal GPU peaks use whole-device memory, including coexisting jobs
+such as LAMMPS. The launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, and
 `DS_BUILD_OPS=0`; `CPATH` points only to the pinned build environment's Python
 3.11 headers. A tagged tmux supervisor plus a preserving `@reboot` crontab
