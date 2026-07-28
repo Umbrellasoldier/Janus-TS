@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from janus_ts import supervisor
+from janus_ts.artifacts import sha256_file, sha256_json, write_json
 from janus_ts.runtime import ResourceUnavailableError, RuntimeContractError
+
+FAILED_REVISION = "1" * 40
+FIXED_REVISION = "2" * 40
 
 
 def make_spec(tmp_path: Path, *, command: tuple[str, ...] = ("/bin/true",)):
@@ -28,6 +32,54 @@ def make_spec(tmp_path: Path, *, command: tuple[str, ...] = ("/bin/true",)):
 
 def completed(returncode: int, *, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+def clean_git_runner(fixed_revision: str = FIXED_REVISION):
+    def runner(command, **kwargs):
+        assert command[:2] == ["/usr/bin/git", "-C"]
+        assert kwargs == {"capture_output": True, "text": True, "check": False}
+        arguments = command[3:]
+        if arguments == ["rev-parse", "--verify", "HEAD"]:
+            return completed(0, stdout=fixed_revision + "\n")
+        if arguments == ["cat-file", "-e", f"{FAILED_REVISION}^{{commit}}"]:
+            return completed(0)
+        if arguments == ["diff", "--quiet", "--no-ext-diff", "HEAD", "--"]:
+            return completed(0)
+        raise AssertionError(arguments)
+
+    return runner
+
+
+def terminal_evidence(
+    spec: supervisor.SupervisorSpec,
+    *,
+    launch_count: int = 1,
+    transient_failures: int = 0,
+) -> tuple[str, str]:
+    spec.log_dir.mkdir(parents=True, exist_ok=True)
+    reason = "delegated command returned permanent exit code 1; only exit code 75 is retryable"
+    state = supervisor._initial_state(spec)
+    state.update(
+        {
+            "failure_reason": reason,
+            "last_exit_code": 1,
+            "launch_count": launch_count,
+            "status": "permanent_failure",
+            "transient_failures": transient_failures,
+        }
+    )
+    supervisor._persist_state(spec, state)
+    write_json(
+        spec.failure_path,
+        {
+            "command_sha256": spec.command_sha256,
+            "exit_code": 1,
+            "reason": reason,
+            "status": "permanent_failure",
+            "tag": spec.tag,
+        },
+    )
+    return sha256_file(spec.state_path), sha256_file(spec.failure_path)
 
 
 def test_spec_requires_absolute_executable_and_frozen_retry_delays(tmp_path: Path):
@@ -199,9 +251,204 @@ def test_permanent_command_failure_stops_and_survives_restart(tmp_path: Path, mo
     assert launches == 1
 
 
-def test_restart_of_running_state_delegates_resume_without_mtime(
+def test_rearm_after_fix_preserves_terminal_evidence_counters_and_next_attempt(
     tmp_path: Path, monkeypatch
 ):
+    spec = make_spec(tmp_path)
+    state_sha256, failure_sha256 = terminal_evidence(spec, launch_count=1, transient_failures=2)
+    attempt_one = spec.log_dir / "command-attempt-0001.log"
+    attempt_one.write_bytes(b"original failed launch\n")
+    attempt_one_sha256 = sha256_file(attempt_one)
+    original_failure = spec.failure_path.read_bytes()
+
+    receipt_path = supervisor.rearm_after_fix(
+        spec,
+        expected_state_sha256=state_sha256,
+        expected_failure_sha256=failure_sha256,
+        failed_revision=FAILED_REVISION,
+        fixed_revision=FIXED_REVISION,
+        reason="Fix dtype-gate trainable-shard bookkeeping.",
+        git_runner=clean_git_runner(),
+    )
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt_path == (spec.log_dir / "recovery-history" / f"{sha256_json(receipt)}.json")
+    assert receipt["state_sha256"] == state_sha256
+    assert receipt["failure_sha256"] == failure_sha256
+    assert receipt["state"]["status"] == "permanent_failure"
+    assert receipt["failure"]["status"] == "permanent_failure"
+    assert receipt["attempt_logs"] == [
+        {"name": "command-attempt-0001.log", "sha256": attempt_one_sha256}
+    ]
+
+    assert spec.failure_path.read_bytes() == original_failure
+    pointer = json.loads(spec.acknowledgement_path.read_text(encoding="utf-8"))
+    assert pointer["status"] == "acknowledged_after_fix"
+    assert pointer["original_failure_sha256"] == failure_sha256
+    assert pointer["receipt_sha256"] == sha256_json(receipt)
+    assert pointer["state_sha256"] == state_sha256
+    rearmed = supervisor._load_state(spec)
+    assert rearmed["status"] == "initialized"
+    assert rearmed["launch_count"] == 1
+    assert rearmed["transient_failures"] == 2
+    assert rearmed["last_exit_code"] is None
+    assert rearmed["recovery_receipt_sha256"] == sha256_json(receipt)
+
+    monkeypatch.setattr(supervisor, "install_frozen_environment", lambda: None)
+    assert (
+        supervisor.supervise(
+            spec,
+            readiness=lambda unused: None,
+            gate=lambda **unused: object(),
+            sleep=lambda unused: None,
+            runner=lambda command, **kwargs: completed(0),
+        )
+        == 0
+    )
+    completed_state = json.loads(spec.state_path.read_text(encoding="utf-8"))
+    assert completed_state["status"] == "complete"
+    assert completed_state["launch_count"] == 2
+    assert (spec.log_dir / "command-attempt-0002.log").is_file()
+    assert sha256_file(attempt_one) == attempt_one_sha256
+
+
+@pytest.mark.parametrize("wrong_field", ["state", "failure"])
+def test_rearm_after_fix_rejects_wrong_evidence_hash_without_mutation(
+    tmp_path: Path, wrong_field: str
+):
+    spec = make_spec(tmp_path)
+    state_sha256, failure_sha256 = terminal_evidence(spec)
+    original_state = spec.state_path.read_bytes()
+    original_failure = spec.failure_path.read_bytes()
+    if wrong_field == "state":
+        state_sha256 = "0" * 64
+    else:
+        failure_sha256 = "0" * 64
+
+    with pytest.raises(supervisor.SupervisorContractError, match="SHA256 mismatch"):
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=state_sha256,
+            expected_failure_sha256=failure_sha256,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=lambda *args, **kwargs: pytest.fail("git must not run"),
+        )
+    assert spec.state_path.read_bytes() == original_state
+    assert spec.failure_path.read_bytes() == original_failure
+    assert not (spec.log_dir / "recovery-history").exists()
+
+
+def test_rearm_after_fix_rejects_nonterminal_state_before_failure_lookup(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    spec.log_dir.mkdir(parents=True)
+    supervisor._persist_state(spec, supervisor._initial_state(spec))
+    with pytest.raises(supervisor.SupervisorContractError, match="only a terminal"):
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=sha256_file(spec.state_path),
+            expected_failure_sha256="0" * 64,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=lambda *args, **kwargs: pytest.fail("git must not run"),
+        )
+
+
+def test_rearm_after_fix_fails_nonblocking_while_supervisor_lock_is_held(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    state_sha256, failure_sha256 = terminal_evidence(spec)
+    with (
+        supervisor.tagged_singleton_lock(spec),
+        pytest.raises(ResourceUnavailableError, match="already held"),
+    ):
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=state_sha256,
+            expected_failure_sha256=failure_sha256,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=lambda *args, **kwargs: pytest.fail("git must not run"),
+        )
+
+
+def test_rearm_after_fix_rejects_dirty_tracked_tree_before_writing_receipt(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    state_sha256, failure_sha256 = terminal_evidence(spec)
+
+    def dirty_git(command, **kwargs):
+        arguments = command[3:]
+        if arguments == ["rev-parse", "--verify", "HEAD"]:
+            return completed(0, stdout=FIXED_REVISION + "\n")
+        if arguments[0] == "cat-file":
+            return completed(0)
+        if arguments[0] == "diff":
+            return completed(1)
+        raise AssertionError(arguments)
+
+    with pytest.raises(supervisor.SupervisorContractError, match="tracked project files"):
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=state_sha256,
+            expected_failure_sha256=failure_sha256,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=dirty_git,
+        )
+    assert not (spec.log_dir / "recovery-history").exists()
+    assert json.loads(spec.state_path.read_text(encoding="utf-8"))["status"] == (
+        "permanent_failure"
+    )
+
+
+def test_rearm_after_fix_is_idempotent_if_final_state_commit_fails(tmp_path: Path, monkeypatch):
+    spec = make_spec(tmp_path)
+    state_sha256, failure_sha256 = terminal_evidence(spec)
+    original_state = spec.state_path.read_bytes()
+    original_failure = spec.failure_path.read_bytes()
+    persist_state = supervisor._persist_state
+
+    def fail_final_state(*args, **kwargs):
+        raise OSError("injected final state write failure")
+
+    monkeypatch.setattr(supervisor, "_persist_state", fail_final_state)
+    with pytest.raises(OSError, match="injected final state"):
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=state_sha256,
+            expected_failure_sha256=failure_sha256,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=clean_git_runner(),
+        )
+    assert spec.state_path.read_bytes() == original_state
+    assert spec.failure_path.read_bytes() == original_failure
+    pointer_before_retry = spec.acknowledgement_path.read_bytes()
+    receipt_paths = list((spec.log_dir / "recovery-history").glob("*.json"))
+    assert len(receipt_paths) == 1
+
+    monkeypatch.setattr(supervisor, "_persist_state", persist_state)
+    assert (
+        supervisor.rearm_after_fix(
+            spec,
+            expected_state_sha256=state_sha256,
+            expected_failure_sha256=failure_sha256,
+            failed_revision=FAILED_REVISION,
+            fixed_revision=FIXED_REVISION,
+            reason="Known implementation fix.",
+            git_runner=clean_git_runner(),
+        )
+        == receipt_paths[0]
+    )
+    assert spec.acknowledgement_path.read_bytes() == pointer_before_retry
+    assert supervisor._load_state(spec)["status"] == "initialized"
+
+
+def test_restart_of_running_state_delegates_resume_without_mtime(tmp_path: Path, monkeypatch):
     spec = make_spec(tmp_path)
     spec.log_dir.mkdir(parents=True)
     state = supervisor._initial_state(spec)

@@ -210,3 +210,23 @@ launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
 3.11 headers. A tagged tmux supervisor plus a preserving `@reboot` crontab
 entry may retry transient failures after 1, 5, and 15 minutes. It must never
 silently change configuration in response to an OOM or other permanent error.
+
+A permanent supervisor state is never cleared by an ordinary launch or reboot.
+After a diagnosed implementation fault is fixed, tested, committed, and the
+tracked source tree is clean, the operator may run the explicit
+`rearm-after-fix` action.  It requires the exact SHA256 values of the stopped
+`state.json` and `PERMANENT_FAILURE.json`, the distinct failed and fixed 40-hex
+Git revisions, a nonempty reason, and the unchanged full supervisor launch
+identity.  Under the same nonblocking singleton lock it verifies that the
+failure payload exactly matches the terminal state and that `HEAD` is the fixed
+revision.  It then writes a content-addressed receipt below
+`artifacts/logs/supervisor/recovery-history/`, writes an atomic
+`ACKNOWLEDGED_FAILURE.json` pointer, and only then rearms the state as the final
+atomic commit while preserving launch and transient-failure counters.  The
+original `PERMANENT_FAILURE.json` bytes are never overwritten, so a failed
+final state write remains terminal and the same exact hashes can be retried
+idempotently.  Thus a failed first launch is retained verbatim and the next
+delegated output is `command-attempt-0002.log`; hash, revision, dirty-tree,
+active-lock, identity, or nonterminal-state mismatches all fail closed.  The
+existing tagged `@reboot` entry remains valid because the tag, log directory,
+lock, and delegated command do not change.

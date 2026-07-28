@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .artifacts import sha256_json, write_json
+from .artifacts import sha256_bytes, sha256_file, sha256_json, write_json
 from .runtime import (
     ResourceUnavailableError,
     RuntimeContractError,
@@ -56,6 +56,8 @@ PERMANENT_EXIT_CODE = 64
 STATE_VERSION = 1
 CRONTAB_MARKER_PREFIX = "# JANUS_TS_SUPERVISOR:"
 _TAG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_GIT_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _VALID_STATES = {
     "initialized",
     "waiting_resources",
@@ -131,6 +133,10 @@ class SupervisorSpec:
     @property
     def failure_path(self) -> Path:
         return self.log_dir / "PERMANENT_FAILURE.json"
+
+    @property
+    def acknowledgement_path(self) -> Path:
+        return self.log_dir / "ACKNOWLEDGED_FAILURE.json"
 
     @property
     def command_sha256(self) -> str:
@@ -287,13 +293,12 @@ def _initial_state(spec: SupervisorSpec) -> dict[str, Any]:
     }
 
 
-def _load_state(spec: SupervisorSpec) -> dict[str, Any]:
-    if not spec.state_path.exists():
-        return _initial_state(spec)
-    try:
-        state = json.loads(spec.state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SupervisorContractError(f"cannot read supervisor state: {exc}") from exc
+def _validate_state(
+    spec: SupervisorSpec,
+    state: Any,
+    *,
+    allow_terminal: bool = False,
+) -> dict[str, Any]:
     if not isinstance(state, dict):
         raise SupervisorContractError("supervisor state must be a JSON object")
     expected = {
@@ -316,12 +321,29 @@ def _load_state(spec: SupervisorSpec) -> dict[str, Any]:
     for field in ("launch_count", "transient_failures"):
         if not isinstance(state.get(field), int) or state[field] < 0:
             raise SupervisorContractError(f"invalid persistent {field}: {state.get(field)!r}")
-    if state.get("status") in {"permanent_failure", "retry_exhausted"}:
+    if not allow_terminal and state.get("status") in {
+        "permanent_failure",
+        "retry_exhausted",
+    }:
         raise PreviousTerminalStateError(
             f"supervisor is stopped in terminal state {state['status']!r}; "
             f"inspect {spec.failure_path}"
         )
     return state
+
+
+def _load_state(
+    spec: SupervisorSpec,
+    *,
+    allow_terminal: bool = False,
+) -> dict[str, Any]:
+    if not spec.state_path.exists():
+        return _initial_state(spec)
+    try:
+        state = json.loads(spec.state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SupervisorContractError(f"cannot read supervisor state: {exc}") from exc
+    return _validate_state(spec, state, allow_terminal=allow_terminal)
 
 
 def _persist_state(spec: SupervisorSpec, state: dict[str, Any]) -> None:
@@ -338,6 +360,212 @@ def _emit(spec: SupervisorSpec, message: str) -> None:
         handle.write(rendered + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _read_hashed_json_object(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
+    try:
+        raw = path.read_bytes()
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SupervisorContractError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SupervisorContractError(f"{label} must be a JSON object")
+    return payload, sha256_bytes(raw)
+
+
+def _require_sha256(value: str, *, label: str) -> str:
+    if not _SHA256_PATTERN.fullmatch(value):
+        raise SupervisorContractError(f"{label} must be exactly 64 lowercase hex characters")
+    return value
+
+
+def _require_git_revision(value: str, *, label: str) -> str:
+    if not _GIT_REVISION_PATTERN.fullmatch(value):
+        raise SupervisorContractError(f"{label} must be exactly 40 lowercase hex characters")
+    return value
+
+
+def _run_git_check(
+    spec: SupervisorSpec,
+    arguments: Sequence[str],
+    *,
+    runner: Callable[..., subprocess.CompletedProcess[str]],
+) -> subprocess.CompletedProcess[str]:
+    return runner(
+        ["/usr/bin/git", "-C", str(spec.project_root), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_fixed_git_tree(
+    spec: SupervisorSpec,
+    *,
+    failed_revision: str,
+    fixed_revision: str,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> None:
+    if failed_revision == fixed_revision:
+        raise SupervisorContractError("failed and fixed revisions must differ")
+    head = _run_git_check(
+        spec,
+        ("rev-parse", "--verify", "HEAD"),
+        runner=runner,
+    )
+    if head.returncode != 0:
+        raise SupervisorContractError(f"cannot resolve project HEAD: {head.stderr.strip()}")
+    if head.stdout.strip() != fixed_revision:
+        raise SupervisorContractError(
+            f"project HEAD {head.stdout.strip()!r} does not equal fixed revision {fixed_revision!r}"
+        )
+    failed_commit = _run_git_check(
+        spec,
+        ("cat-file", "-e", f"{failed_revision}^{{commit}}"),
+        runner=runner,
+    )
+    if failed_commit.returncode != 0:
+        raise SupervisorContractError(
+            f"failed revision is not an available commit: {failed_revision}"
+        )
+    clean = _run_git_check(
+        spec,
+        ("diff", "--quiet", "--no-ext-diff", "HEAD", "--"),
+        runner=runner,
+    )
+    if clean.returncode == 1:
+        raise SupervisorContractError(
+            "tracked project files differ from fixed revision; commit or restore them first"
+        )
+    if clean.returncode != 0:
+        raise SupervisorContractError(f"cannot audit tracked project files: {clean.stderr.strip()}")
+
+
+def _attempt_log_hashes(spec: SupervisorSpec, *, launch_count: int) -> list[dict[str, str]]:
+    hashes: list[dict[str, str]] = []
+    for ordinal in range(1, launch_count + 1):
+        path = spec.log_dir / f"command-attempt-{ordinal:04d}.log"
+        if path.is_file():
+            hashes.append({"name": path.name, "sha256": sha256_file(path)})
+    return hashes
+
+
+def rearm_after_fix(
+    spec: SupervisorSpec,
+    *,
+    expected_state_sha256: str,
+    expected_failure_sha256: str,
+    failed_revision: str,
+    fixed_revision: str,
+    reason: str,
+    git_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> Path:
+    """Acknowledge one exact fixed terminal failure without erasing its evidence."""
+
+    expected_state_sha256 = _require_sha256(expected_state_sha256, label="expected state SHA256")
+    expected_failure_sha256 = _require_sha256(
+        expected_failure_sha256, label="expected failure SHA256"
+    )
+    failed_revision = _require_git_revision(failed_revision, label="failed revision")
+    fixed_revision = _require_git_revision(fixed_revision, label="fixed revision")
+    reason = reason.strip()
+    if not reason:
+        raise SupervisorContractError("rearm reason must be nonempty")
+
+    with tagged_singleton_lock(spec):
+        state, state_sha256 = _read_hashed_json_object(spec.state_path, label="supervisor state")
+        state = _validate_state(spec, state, allow_terminal=True)
+        if state["status"] not in {"permanent_failure", "retry_exhausted"}:
+            raise SupervisorContractError(
+                f"only a terminal supervisor state can be rearmed, found {state['status']!r}"
+            )
+        if state_sha256 != expected_state_sha256:
+            raise SupervisorContractError(
+                f"supervisor state SHA256 mismatch: {state_sha256} != {expected_state_sha256}"
+            )
+
+        failure, failure_sha256 = _read_hashed_json_object(
+            spec.failure_path, label="permanent failure evidence"
+        )
+        if failure_sha256 != expected_failure_sha256:
+            raise SupervisorContractError(
+                f"permanent failure SHA256 mismatch: {failure_sha256} != {expected_failure_sha256}"
+            )
+        expected_failure = {
+            "command_sha256": spec.command_sha256,
+            "exit_code": state.get("last_exit_code"),
+            "reason": state.get("failure_reason"),
+            "status": state["status"],
+            "tag": spec.tag,
+        }
+        if failure != expected_failure:
+            raise SupervisorContractError(
+                "permanent failure evidence does not exactly match terminal state"
+            )
+
+        _assert_fixed_git_tree(
+            spec,
+            failed_revision=failed_revision,
+            fixed_revision=fixed_revision,
+            runner=git_runner,
+        )
+        receipt = {
+            "action": "rearm-after-fix",
+            "attempt_logs": _attempt_log_hashes(spec, launch_count=int(state["launch_count"])),
+            "command_sha256": spec.command_sha256,
+            "failed_revision": failed_revision,
+            "failure": failure,
+            "failure_sha256": failure_sha256,
+            "fixed_revision": fixed_revision,
+            "reason": reason,
+            "state": state,
+            "state_sha256": state_sha256,
+            "tag": spec.tag,
+            "version": 1,
+        }
+        receipt_sha256 = sha256_json(receipt)
+        receipt_path = spec.log_dir / "recovery-history" / f"{receipt_sha256}.json"
+        if receipt_path.exists():
+            existing, _ = _read_hashed_json_object(receipt_path, label="existing recovery receipt")
+            if existing != receipt or sha256_json(existing) != receipt_sha256:
+                raise SupervisorContractError(
+                    f"recovery receipt path contains different content: {receipt_path}"
+                )
+        else:
+            write_json(receipt_path, receipt)
+
+        receipt_relative_path = str(receipt_path.relative_to(spec.log_dir))
+        write_json(
+            spec.acknowledgement_path,
+            {
+                "command_sha256": spec.command_sha256,
+                "failed_revision": failed_revision,
+                "fixed_revision": fixed_revision,
+                "original_failure_sha256": failure_sha256,
+                "original_status": state["status"],
+                "receipt_path": receipt_relative_path,
+                "receipt_sha256": receipt_sha256,
+                "state_sha256": state_sha256,
+                "status": "acknowledged_after_fix",
+                "tag": spec.tag,
+            },
+        )
+        rearmed_state = _initial_state(spec)
+        rearmed_state.update(
+            {
+                "launch_count": int(state["launch_count"]),
+                "transient_failures": int(state["transient_failures"]),
+                "recovery_receipt_path": receipt_relative_path,
+                "recovery_receipt_sha256": receipt_sha256,
+            }
+        )
+        _persist_state(spec, rearmed_state)
+        _emit(
+            spec,
+            f"REARMED_AFTER_FIX: receipt={receipt_relative_path} next_launch="
+            f"{int(state['launch_count']) + 1}",
+        )
+        return receipt_path
 
 
 def wait_for_host_resources(
@@ -755,6 +983,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     for action in ("run", "launch-tmux", "render-reboot", "install-reboot"):
         child = subparsers.add_parser(action)
         _add_common_arguments(child)
+    rearm = subparsers.add_parser("rearm-after-fix")
+    rearm.add_argument("--expected-state-sha256", required=True)
+    rearm.add_argument("--expected-failure-sha256", required=True)
+    rearm.add_argument("--failed-revision", required=True)
+    rearm.add_argument("--fixed-revision", required=True)
+    rearm.add_argument("--reason", required=True)
+    _add_common_arguments(rearm)
     return parser
 
 
@@ -773,6 +1008,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "install-reboot":
             changed = install_reboot_crontab(spec)
             print("installed" if changed else "already-current")
+            return 0
+        if args.action == "rearm-after-fix":
+            receipt = rearm_after_fix(
+                spec,
+                expected_state_sha256=args.expected_state_sha256,
+                expected_failure_sha256=args.expected_failure_sha256,
+                failed_revision=args.failed_revision,
+                fixed_revision=args.fixed_revision,
+                reason=args.reason,
+            )
+            print(receipt)
             return 0
         raise AssertionError(args.action)
     except PreviousTerminalStateError as exc:
@@ -812,6 +1058,7 @@ __all__ = [
     "launch_tmux",
     "main",
     "merge_tagged_crontab",
+    "rearm_after_fix",
     "supervise",
     "tagged_singleton_lock",
     "wait_for_tagged_singleton_lock",
