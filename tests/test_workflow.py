@@ -91,6 +91,87 @@ def test_incomplete_stage_is_not_resume_evidence(tmp_path: Path):
     assert workflow.load_stage(stage, stage="unit", fingerprint="a" * 64) is None
 
 
+def _pissa_resource_report(*, scope: str, swap_growth_kib: int) -> dict[str, object]:
+    minimum = workflow.PISSA_MIN_MEM_AVAILABLE_KIB
+    return {
+        "policy": workflow.PISSA_RESOURCE_POLICY,
+        "scope": scope,
+        "minimum_mem_available_kib": minimum,
+        "swap_growth_is_diagnostic": True,
+        "other_gpu_phases_max_swap_growth_kib": 256 * 1024,
+        "observed_swap_growth_kib": swap_growth_kib,
+        "host_before": {"mem_available_kib": minimum + 1024},
+        "host_after": {"mem_available_kib": minimum},
+    }
+
+
+def test_prepare_pissa_hashes_once_and_rechecks_a_resumed_stage(tmp_path: Path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text('{"artifact_type":"pissa"}\n', encoding="utf-8")
+    cpu = SimpleNamespace(
+        launch_fingerprint="f" * 64,
+        config=SimpleNamespace(
+            model=SimpleNamespace(cache_dir=tmp_path / "hub"),
+            runtime=SimpleNamespace(
+                local_cache_root=tmp_path / "cache",
+                gpu_lock_path=tmp_path / "gpu.lock",
+            ),
+        ),
+    )
+    calls = 0
+
+    def prepare(**kwargs):
+        nonlocal calls
+        calls += 1
+        assert kwargs["local_cache_root"] == tmp_path / "cache"
+        scope = "full_serialization" if calls == 1 else "cached_payload_verification"
+        return {
+            "files_sha256": "a" * 64,
+            "preparation_resources": _pissa_resource_report(
+                scope=scope,
+                swap_growth_kib=calls * 1024,
+            ),
+        }
+
+    monkeypatch.setattr(workflow, "pissa_bundle_path", lambda cache: bundle)
+    monkeypatch.setattr(workflow, "prepare_pissa_gate", prepare)
+
+    first_bundle, first = workflow._prepare_pissa(cpu, tmp_path / "gates")
+    second_bundle, second = workflow._prepare_pissa(cpu, tmp_path / "gates")
+
+    assert first_bundle == second_bundle == bundle
+    assert calls == 2
+    assert second == first
+    assert first["observed_swap_growth_kib"] == 1024
+    assert first["preparation_resources"]["scope"] == "full_serialization"
+
+
+def test_prepare_pissa_never_defaults_missing_resource_evidence(tmp_path: Path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text("{}\n", encoding="utf-8")
+    cpu = SimpleNamespace(
+        launch_fingerprint="f" * 64,
+        config=SimpleNamespace(
+            model=SimpleNamespace(cache_dir=tmp_path / "hub"),
+            runtime=SimpleNamespace(
+                local_cache_root=tmp_path / "cache",
+                gpu_lock_path=tmp_path / "gpu.lock",
+            ),
+        ),
+    )
+    monkeypatch.setattr(workflow, "pissa_bundle_path", lambda cache: bundle)
+    monkeypatch.setattr(
+        workflow,
+        "prepare_pissa_gate",
+        lambda **kwargs: {"files_sha256": "a" * 64},
+    )
+
+    with pytest.raises(workflow.WorkflowError, match="resource evidence"):
+        workflow._prepare_pissa(cpu, tmp_path / "gates")
+
+
 def test_torchrun_is_absolute_two_rank_project_executable():
     command = workflow.torchrun_command("janus_ts.gpu_gates", "--x", "1")
     assert Path(command[0]).is_absolute()

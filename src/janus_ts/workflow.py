@@ -44,9 +44,10 @@ from .checkpointing import (
 from .config import ExperimentConfig, load_config
 from .constants import MODEL_ID, MODEL_REVISION
 from .gates import (
+    PISSA_MIN_MEM_AVAILABLE_KIB,
+    PISSA_RESOURCE_POLICY,
     pissa_bundle_path,
     prepare_pissa_gate,
-    verify_bundle_payload,
 )
 from .native_stack import audit_native_stack
 from .preprocessing import (
@@ -627,26 +628,65 @@ def _run_dtype_gate(
     return report
 
 
+def _pissa_resource_evidence(report: Mapping[str, Any]) -> dict[str, Any]:
+    resources = report.get("preparation_resources")
+    if not isinstance(resources, Mapping):
+        raise WorkflowError("PiSSA gate did not return preparation resource evidence")
+    if (
+        resources.get("policy") != PISSA_RESOURCE_POLICY
+        or resources.get("scope")
+        not in {"full_serialization", "cached_payload_verification"}
+        or resources.get("minimum_mem_available_kib")
+        != PISSA_MIN_MEM_AVAILABLE_KIB
+        or resources.get("swap_growth_is_diagnostic") is not True
+        or resources.get("other_gpu_phases_max_swap_growth_kib") != 256 * 1024
+        or type(resources.get("observed_swap_growth_kib")) is not int
+        or not isinstance(resources.get("host_before"), Mapping)
+        or not isinstance(resources.get("host_after"), Mapping)
+    ):
+        raise WorkflowError("PiSSA preparation resource evidence violates the frozen policy")
+    return dict(resources)
+
+
 def _prepare_pissa(cpu: CpuAuditResult, gate_root: Path) -> tuple[Path, dict[str, Any]]:
     stage = gate_root / "03-pissa"
     bundle = pissa_bundle_path(cpu.config.runtime.local_cache_root)
-    if report := load_stage(stage, stage="pissa", fingerprint=cpu.launch_fingerprint):
-        verify_bundle_payload(bundle)
-        return bundle, report
+    prior = load_stage(stage, stage="pissa", fingerprint=cpu.launch_fingerprint)
     # prepare_pissa_gate owns the same non-reentrant lock internally.  Do not
-    # wrap this call in another flock.
+    # wrap this call in another flock. It also hashes an existing bundle once,
+    # so no second 54.7 GB payload pass is needed here.
     report = prepare_pissa_gate(
         hub_cache_dir=cpu.config.model.cache_dir,
         local_cache_root=cpu.config.runtime.local_cache_root,
         gpu_lock_path=cpu.config.runtime.gpu_lock_path,
     )
-    verified = verify_bundle_payload(bundle)
+    resources = _pissa_resource_evidence(report)
+    manifest_sha256 = sha256_file(bundle / "manifest.json")
+    files_sha256 = report.get("files_sha256")
+    if not isinstance(files_sha256, str) or len(files_sha256) != 64:
+        raise WorkflowError("PiSSA gate did not return the aggregate payload hash")
+    if prior is not None:
+        _pissa_resource_evidence(prior)
+        expected = {
+            "bundle": str(bundle),
+            "manifest_sha256": manifest_sha256,
+            "files_sha256": files_sha256,
+        }
+        drift = {
+            key: {"sealed": prior.get(key), "current": value}
+            for key, value in expected.items()
+            if prior.get(key) != value
+        }
+        if drift:
+            raise WorkflowError(f"cached PiSSA stage drift: {drift}")
+        return bundle, prior
     evidence = {
         "status": "pass",
         "bundle": str(bundle),
-        "manifest_sha256": sha256_file(bundle / "manifest.json"),
-        "files_sha256": verified.get("files_sha256"),
-        "observed_swap_growth_kib": report.get("observed_swap_growth_kib", 0),
+        "manifest_sha256": manifest_sha256,
+        "files_sha256": files_sha256,
+        "preparation_resources": resources,
+        "observed_swap_growth_kib": resources["observed_swap_growth_kib"],
     }
     seal_stage(stage, stage="pissa", fingerprint=cpu.launch_fingerprint, report=evidence)
     return bundle, evidence

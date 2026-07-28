@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -28,19 +28,59 @@ PISSA_PARITY_MIN_TOP_K_OVERLAP = 0.90
 PISSA_PARITY_MAX_TOTAL_VARIATION = 0.05
 PISSA_PARITY_MAX_JENSEN_SHANNON = 0.002
 PISSA_PARITY_MAX_CENTERED_NRMSE = 0.05
+PISSA_MIN_MEM_AVAILABLE_KIB = 16 * 1024 * 1024
+PISSA_RESOURCE_POLICY = "pissa-one-time-serialization-memavailable-v1"
 
 
 class GateError(RuntimeError):
     """A frozen launch gate did not pass."""
 
 
-def _swap_used_kib() -> int:
-    values: dict[str, int] = {}
-    for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-        if ":" in line:
-            name, value = line.split(":", 1)
-            values[name] = int(value.strip().split()[0])
-    return values["SwapTotal"] - values["SwapFree"]
+def _pissa_resource_evidence(
+    before: Any,
+    after: Any,
+    *,
+    scope: str,
+    creation_host_before: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply the confirmed one-time serialization host-memory policy."""
+
+    if scope not in {"full_serialization", "cached_payload_verification"}:
+        raise GateError(f"invalid PiSSA resource observation scope: {scope!r}")
+    for label, status in (("before", before), ("after", after)):
+        available = getattr(status, "mem_available_kib", None)
+        if type(available) is not int or available < PISSA_MIN_MEM_AVAILABLE_KIB:
+            raise GateError(
+                f"PiSSA {scope} MemAvailable {label}={available!r} KiB, "
+                f"requires >= {PISSA_MIN_MEM_AVAILABLE_KIB} KiB"
+            )
+        swap_free = getattr(status, "swap_free_kib", None)
+        if type(swap_free) is not int or swap_free < 0:
+            raise GateError(f"PiSSA {scope} SwapFree {label} is invalid: {swap_free!r}")
+
+    evidence = {
+        "policy": PISSA_RESOURCE_POLICY,
+        "scope": scope,
+        "minimum_mem_available_kib": PISSA_MIN_MEM_AVAILABLE_KIB,
+        "swap_growth_is_diagnostic": True,
+        "other_gpu_phases_max_swap_growth_kib": 256 * 1024,
+        "observed_swap_growth_kib": before.swap_free_kib - after.swap_free_kib,
+        "host_before": before.to_dict(),
+        "host_after": after.to_dict(),
+    }
+    if creation_host_before is not None:
+        evidence["creation_host_before"] = dict(creation_host_before)
+    return evidence
+
+
+def _creation_host_before(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise GateError("PiSSA bundle manifest lacks metadata")
+    host = metadata.get("host_before")
+    if not isinstance(host, Mapping):
+        raise GateError("PiSSA bundle manifest lacks creation host evidence")
+    return host
 
 
 class _PissaLoraOutputProbe:
@@ -316,13 +356,21 @@ def prepare_pissa_gate(
 
     install_frozen_environment()
     destination = pissa_bundle_path(local_cache_root)
-    if destination.exists():
-        return verify_bundle_payload(destination)
     with exclusive_lock(gpu_lock_path):
         allowed = tuple(
             sorted(set(descendant_pids()) | set(approved_external_gpu_pids()))
         )
         before = assert_host_ready(allowed_pids=allowed)
+        if destination.exists():
+            manifest = verify_bundle_payload(destination)
+            after = assert_host_ready(allowed_pids=allowed)
+            resources = _pissa_resource_evidence(
+                before,
+                after,
+                scope="cached_payload_verification",
+                creation_host_before=_creation_host_before(manifest),
+            )
+            return {**manifest, "preparation_resources": resources}
         native = audit_native_stack()
         snapshot = audit_snapshot(cache_dir=hub_cache_dir)
         from transformers import AutoTokenizer
@@ -331,7 +379,6 @@ def prepare_pissa_gate(
             snapshot["snapshot"], local_files_only=True, trust_remote_code=False
         )
         probe = PissaParityProbe(tokenizer)
-        swap_before = _swap_used_kib()
         manifest = prepare_pissa_residual_bundle(
             destination,
             cache_dir=hub_cache_dir,
@@ -346,14 +393,14 @@ def prepare_pissa_gate(
             spec=DEFAULT_PISSA_PREPARATION_SPEC,
             local_files_only=True,
         )
-        swap_growth = _swap_used_kib() - swap_before
-        if swap_growth > 256 * 1024:
-            raise GateError(
-                f"PiSSA preparation grew swap by {swap_growth / 1024:.1f} MiB (>256 MiB)"
-            )
-        # The immutable bundle has already recorded its stage parity. This
-        # outer value is returned for the launch-gate report.
-        return {**manifest, "observed_swap_growth_kib": swap_growth}
+        after = assert_host_ready(allowed_pids=allowed)
+        resources = _pissa_resource_evidence(
+            before,
+            after,
+            scope="full_serialization",
+            creation_host_before=_creation_host_before(manifest),
+        )
+        return {**manifest, "preparation_resources": resources}
 
 
 def write_environment_gate(output_dir: str | Path) -> dict[str, Any]:
@@ -386,6 +433,8 @@ __all__ = [
     "PISSA_PARITY_MAX_TOTAL_VARIATION",
     "PISSA_PARITY_MIN_TOP_K_OVERLAP",
     "PISSA_PARITY_TOP_K",
+    "PISSA_MIN_MEM_AVAILABLE_KIB",
+    "PISSA_RESOURCE_POLICY",
     "PissaParityProbe",
     "complete_gate_directory",
     "pissa_bundle_path",

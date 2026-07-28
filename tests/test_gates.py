@@ -6,10 +6,12 @@ import pytest
 import torch
 
 from janus_ts.gates import (
+    PISSA_MIN_MEM_AVAILABLE_KIB,
     GateError,
     PissaParityProbe,
     _assert_pissa_behavioral_parity,
     _pissa_behavioral_metrics,
+    _pissa_resource_evidence,
 )
 
 
@@ -103,3 +105,33 @@ def test_pissa_behavioral_metrics_reject_nonfinite_or_shape_drift() -> None:
         _pissa_behavioral_metrics(torch.ones(4), torch.ones(3))
     with pytest.raises(GateError, match="NaN or infinity"):
         _pissa_behavioral_metrics(torch.ones(4), torch.tensor([1.0, 2.0, 3.0, float("nan")]))
+
+
+def test_pissa_serialization_records_swap_without_applying_compute_limit() -> None:
+    before = SimpleNamespace(
+        mem_available_kib=PISSA_MIN_MEM_AVAILABLE_KIB + 1024,
+        swap_free_kib=4 * 1024 * 1024,
+        to_dict=lambda: {"mem_available_kib": PISSA_MIN_MEM_AVAILABLE_KIB + 1024},
+    )
+    after = SimpleNamespace(
+        mem_available_kib=PISSA_MIN_MEM_AVAILABLE_KIB,
+        swap_free_kib=512 * 1024,
+        to_dict=lambda: {"mem_available_kib": PISSA_MIN_MEM_AVAILABLE_KIB},
+    )
+
+    evidence = _pissa_resource_evidence(before, after, scope="full_serialization")
+
+    assert evidence["observed_swap_growth_kib"] == 3584 * 1024
+    assert evidence["swap_growth_is_diagnostic"] is True
+    assert evidence["other_gpu_phases_max_swap_growth_kib"] == 256 * 1024
+
+
+def test_pissa_serialization_still_rejects_low_available_memory() -> None:
+    low = SimpleNamespace(
+        mem_available_kib=PISSA_MIN_MEM_AVAILABLE_KIB - 1,
+        swap_free_kib=1024,
+        to_dict=lambda: {},
+    )
+
+    with pytest.raises(GateError, match="MemAvailable"):
+        _pissa_resource_evidence(low, low, scope="cached_payload_verification")

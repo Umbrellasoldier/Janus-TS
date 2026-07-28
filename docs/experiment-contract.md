@@ -210,11 +210,19 @@ phase; the allowlist cannot grow, although it may shrink as an original
 process exits.  The workflow never signals or kills any of these processes or
 any other user's process.
 
-Sharing does not relax either resource gate: `MemAvailable >= 16 GiB`, host
-swap growth `<= 256 MiB`, and the `45,056 MiB` per-GPU peak limit remain in
-force.  The GPU peak is measured as whole-device memory usage, including the
-allowed LAMMPS allocation, rather than as Janus-TS process memory alone.  The
-launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
+Sharing does not relax the `45,056 MiB` per-GPU peak limit.  It also retains
+`MemAvailable >= 16 GiB` and host swap growth `<= 256 MiB` for every compute,
+memory-smoke, resume, and formal-training/evaluation phase.  The sole scoped
+exception is one-time PiSSA bundle serialization and cached payload hashing:
+both their starting and ending `MemAvailable` must be at least 16 GiB, while
+swap growth is recorded as a diagnostic rather than a rejection criterion.
+The initial 54.7 GB serialization completed with `MemAvailable` approximately
+20--23 GiB and observed peak swap growth 3,081.7 MiB; the user explicitly
+accepted this file-cache-induced cold-page eviction on 2026-07-28. Cached
+reuse must retain non-default resource evidence and may not silently report a
+missing observation as zero. The GPU peak is measured as whole-device memory
+usage, including the allowed LAMMPS allocation, rather than as Janus-TS
+process memory alone.  The launcher sets `NCCL_P2P_DISABLE=1`, `NCCL_IB_DISABLE=1`,
 `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, and
 `DS_BUILD_OPS=0`; `CPATH` points only to the pinned build environment's Python
 3.11 headers. A tagged tmux supervisor plus a preserving `@reboot` crontab
