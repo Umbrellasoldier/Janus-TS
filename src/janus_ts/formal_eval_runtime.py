@@ -215,7 +215,7 @@ class DeepSpeedGenerationProxy:
         engine: Any,
         *,
         autocast_context: Callable[[Any], Any] | None = None,
-        probe_factory: Callable[[Any], Any] = _LoraBf16OutputProbe,
+        probe_factory: Callable[[Any], Any] | None = _LoraBf16OutputProbe,
     ) -> None:
         module = getattr(engine, "module", None)
         if module is None or not callable(getattr(module, "generate", None)):
@@ -235,7 +235,7 @@ class DeepSpeedGenerationProxy:
 
     def generate(self, *args: Any, **kwargs: Any) -> Any:
         probe = None
-        if not self._bf16_compute_verified:
+        if not self._bf16_compute_verified and self._probe_factory is not None:
             probe = self._probe_factory(self.module)
             probe.start()
         try:

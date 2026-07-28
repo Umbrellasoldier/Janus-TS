@@ -685,13 +685,27 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
         lambda values: tuple(values)[2],
     )
 
-    def comparison(_prepared, selected, predictions_path):
-        del selected, predictions_path
-        path = _prepared.paths.evaluations / "v24-comparison.json"
+    baseline = SimpleNamespace(model_fingerprint="b" * 64, protocol={"training_updates": 0})
+
+    def zero_shot(_prepared, *, runner):
+        del runner
+        root = _prepared.paths.evaluations
+        metrics = root / "zero-shot.metrics.json"
+        predictions = root / "zero-shot.predictions.jsonl"
+        metrics.write_text("{}\n", encoding="utf-8")
+        predictions.write_text("{}\n", encoding="utf-8")
+        return baseline, metrics, predictions
+
+    monkeypatch.setattr(workflow, "_run_zero_shot_baseline", zero_shot)
+
+    def comparison(_prepared, selected, **kwargs):
+        assert selected == checkpoints[2]
+        assert kwargs["baseline"] is baseline
+        path = _prepared.paths.evaluations / "zero-shot-comparison.json"
         path.write_text("{}\n", encoding="utf-8")
         return path
 
-    monkeypatch.setattr(workflow, "_write_v24_comparison", comparison)
+    monkeypatch.setattr(workflow, "_write_zero_shot_comparison", comparison)
 
     first = workflow.run_evaluation_phase(prepared, checkpoints)
     second = workflow.run_evaluation_phase(prepared, checkpoints)
@@ -708,6 +722,7 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
     assert state["stage"] == "complete"
     assert state["selected_epoch"] == 3
     assert state["test_evaluated"] is True
+    assert state["zero_shot_baseline_evaluated"] is True
 
 
 def test_checkpoint_callback_factory_is_late_bound(tmp_path):

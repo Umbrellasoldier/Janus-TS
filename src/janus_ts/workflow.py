@@ -55,7 +55,6 @@ from .preprocessing import (
     expected_processed_path,
     inventory_sources,
     load_pinned_tokenizer,
-    load_processed_dataset,
 )
 from .run_state import (
     RunIdentity,
@@ -401,10 +400,6 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
         raise WorkflowError("processed data audit did not return a SHA256 fingerprint")
     snapshot = audit_snapshot(cache_dir=config.model.cache_dir)
     native = audit_native_stack()
-    from .v24 import audit_v24_source
-
-    processed_dataset = load_processed_dataset(processed)
-    v24_source = audit_v24_source(current_test_ids=tuple(processed_dataset["test"]["reaction_id"]))
     report = {
         "schema_version": WORKFLOW_SCHEMA_VERSION,
         "status": "pass",
@@ -413,7 +408,6 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
         "data_audit": data_audit,
         "snapshot": snapshot,
         "native_stack": native,
-        "v24_source": v24_source,
         "host_policy": (
             "GPU sharing is allowed; host memory and whole-device peak GPU memory "
             "are checked independently"
@@ -428,7 +422,6 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
             "model_revision": MODEL_REVISION,
             "snapshot_critical_sha256": snapshot["critical_sha256"],
             "native_stack": native,
-            "v24_source": v24_source,
         }
     )
     return CpuAuditResult(
@@ -1694,6 +1687,20 @@ def _formal_eval_command(
     return torchrun_command("janus_ts.formal_eval_runtime", *arguments)
 
 
+def _zero_shot_eval_command(prepared: PreparedRun) -> tuple[str, ...]:
+    return torchrun_command(
+        "janus_ts.zero_shot_runtime",
+        "--config",
+        str(prepared.config_path),
+        "--processed-path",
+        str(prepared.processed_path),
+        "--output-dir",
+        str(prepared.paths.evaluations.resolve()),
+        "--run-fingerprint",
+        prepared.run_identity.fingerprint,
+    )
+
+
 def _validate_generation_smoke(value: Any, config: ExperimentConfig) -> None:
     """Validate formal parsing plus the forced-full-512 stress receipt."""
 
@@ -2004,59 +2011,140 @@ def _write_or_validate_selection_proof(
     return write_selection_proof(path, proof)
 
 
-def _write_v24_comparison(
-    prepared: PreparedRun,
-    selected: EpochCheckpoint,
-    predictions_path: Path,
-) -> Path:
-    from .evaluation import aggregate_evaluations, evaluate_reaction
-    from .generation import load_merged_predictions
-    from .preprocessing import load_processed_dataset, reaction_record_from_row
-    from .v24 import (
-        audit_v24_source,
-        evaluate_v24_intersection,
-        subset_qwen_predictions,
+def _validate_zero_shot_receipt(prepared: PreparedRun) -> tuple[Any, Path, Path]:
+    from .generation import merged_predictions_path, metrics_path
+    from .zero_shot_runtime import (
+        build_zero_shot_baseline,
+        validate_zero_shot_completion,
     )
 
-    dataset = load_processed_dataset(prepared.processed_path)
-    records = tuple(reaction_record_from_row(row) for row in dataset["test"])
-    by_id = {record.reaction_id: record for record in records}
-    identity = _generation_identity(prepared, selected, "test")
-    rows = load_merged_predictions(
-        predictions_path,
-        identity,
-        expected_reaction_ids=tuple(record.reaction_id for record in records),
+    baseline = build_zero_shot_baseline(
+        prepared.config,
+        prepared.processed_path,
+        run_fingerprint=prepared.run_identity.fingerprint,
     )
-    qwen_all = {row.reaction_id: row.raw_beams for row in rows}
-    v24_source_audit = audit_v24_source(current_test_ids=tuple(by_id))
-    intersection, v24_report = evaluate_v24_intersection(by_id)
-    qwen_subset = subset_qwen_predictions(qwen_all, intersection)
-    qwen_evaluations = tuple(
-        evaluate_reaction(
-            reaction_id,
-            qwen_subset[reaction_id],
-            by_id[reaction_id].ts_edges,
-            atom_count=by_id[reaction_id].atom_count,
+    receipt = validate_zero_shot_completion(prepared.paths.evaluations, baseline)
+    if receipt is None:
+        raise WorkflowError("zero-shot test evaluation has no complete receipt")
+    identity = baseline.generation_identity("test")
+    metrics = metrics_path(prepared.paths.evaluations, identity)
+    predictions = merged_predictions_path(prepared.paths.evaluations, identity)
+    if not metrics.is_file() or not predictions.is_file():
+        raise WorkflowError("zero-shot receipt lacks metrics or predictions")
+    return baseline, metrics, predictions
+
+
+def _run_zero_shot_baseline(
+    prepared: PreparedRun,
+    *,
+    runner: Runner,
+) -> tuple[Any, Path, Path]:
+    from .zero_shot_runtime import build_zero_shot_baseline
+
+    baseline = build_zero_shot_baseline(
+        prepared.config,
+        prepared.processed_path,
+        run_fingerprint=prepared.run_identity.fingerprint,
+    )
+    stage = prepared.paths.project / "workflow" / f"zero-shot-{baseline.model_fingerprint}"
+    stored = load_stage(
+        stage,
+        stage="formal-zero-shot-test",
+        fingerprint=baseline.model_fingerprint,
+    )
+    if stored is not None:
+        return _validate_zero_shot_receipt(prepared)
+
+    try:
+        baseline, metrics, predictions = _validate_zero_shot_receipt(prepared)
+    except WorkflowError as exc:
+        if "no complete receipt" not in str(exc):
+            raise
+        outcome = run_locked_gpu_command(
+            "formal-test-zero-shot",
+            _zero_shot_eval_command(prepared),
+            lock_path=prepared.config.runtime.gpu_lock_path,
+            required_gpu_count=prepared.config.runtime.required_gpu_count,
+            runner=runner,
         )
-        for reaction_id in intersection
+        _require_success(outcome)
+        baseline, metrics, predictions = _validate_zero_shot_receipt(prepared)
+
+    report = {
+        "status": "pass",
+        "split": "test",
+        "model": "Qwen/Qwen3.6-27B zero-shot",
+        "model_fingerprint": baseline.model_fingerprint,
+        "metrics": str(metrics),
+        "metrics_sha256": sha256_file(metrics),
+        "predictions": str(predictions),
+        "predictions_sha256": sha256_file(predictions),
+    }
+    seal_stage(
+        stage,
+        stage="formal-zero-shot-test",
+        fingerprint=baseline.model_fingerprint,
+        report=report,
     )
-    qwen_report = aggregate_evaluations(qwen_evaluations)
-    output = prepared.paths.evaluations / "v24-comparison.json"
+    return baseline, metrics, predictions
+
+
+def _validated_test_report(path: Path) -> Mapping[str, Any]:
+    from .constants import FORMAL_EVAL_K
+    from .generation import EXPECTED_FORMAL_SPLIT_COUNTS
+
+    payload = _read_json(path)
+    evaluation = payload.get("evaluation")
+    if not isinstance(evaluation, Mapping):
+        raise WorkflowError(f"test metrics lacks evaluation report: {path}")
+    metrics = evaluation.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise WorkflowError(f"test evaluation lacks metrics: {path}")
+    expected_labels = {f"@{value}" for value in FORMAL_EVAL_K}
+    if set(metrics) != expected_labels:
+        raise WorkflowError(f"test evaluation has wrong k values: {sorted(metrics)!r}")
+    expected_count = EXPECTED_FORMAL_SPLIT_COUNTS["test"]
+    for label in expected_labels:
+        summary = metrics[label]
+        if not isinstance(summary, Mapping) or summary.get("count") != expected_count:
+            raise WorkflowError(f"test {label} count is not {expected_count}")
+    return evaluation
+
+
+def _write_zero_shot_comparison(
+    prepared: PreparedRun,
+    selected: EpochCheckpoint,
+    *,
+    selected_metrics: Path,
+    selected_predictions: Path,
+    baseline: Any,
+    baseline_metrics: Path,
+    baseline_predictions: Path,
+) -> Path:
+    output = prepared.paths.evaluations / "zero-shot-comparison.json"
     payload = {
-        "schema_version": "janus-ts-v24-comparison-v1",
+        "schema_version": "janus-ts-zero-shot-comparison-v1",
         "data_fingerprint": prepared.run_identity.data_fingerprint,
         "run_fingerprint": prepared.run_identity.fingerprint,
-        "selected_checkpoint_fingerprint": selected.checkpoint_fingerprint,
-        "selected_epoch": selected.epoch,
-        "intersection_count": len(intersection),
-        "intersection_reaction_ids": list(intersection),
-        "v24_source_audit": v24_source_audit,
-        "qwen": qwen_report.to_json_dict(),
-        "chemformer_reactiont5v2_v24": v24_report.to_json_dict(),
+        "test_count": 996,
+        "fine_tuned_qwen": {
+            "selected_epoch": selected.epoch,
+            "checkpoint_fingerprint": selected.checkpoint_fingerprint,
+            "metrics_sha256": sha256_file(selected_metrics),
+            "predictions_sha256": sha256_file(selected_predictions),
+            "evaluation": _validated_test_report(selected_metrics),
+        },
+        "qwen_zero_shot": {
+            "model_fingerprint": baseline.model_fingerprint,
+            "protocol": dict(baseline.protocol),
+            "metrics_sha256": sha256_file(baseline_metrics),
+            "predictions_sha256": sha256_file(baseline_predictions),
+            "evaluation": _validated_test_report(baseline_metrics),
+        },
     }
     if output.exists():
         if _read_json(output) != payload:
-            raise WorkflowError("v24 comparison artifact drift")
+            raise WorkflowError("zero-shot comparison artifact drift")
     else:
         write_json(output, payload)
     return output
@@ -2068,7 +2156,7 @@ def run_evaluation_phase(
     *,
     runner: Runner = subprocess.run,
 ) -> EpochCheckpoint:
-    """Validate five epochs, lock the @10 winner, test once, then compare v24."""
+    """Validate five epochs, test the winner, then compare raw-Qwen zero-shot."""
 
     from .evaluation import select_best_checkpoint
     from .formal_eval_runtime import load_checkpoint_score
@@ -2116,14 +2204,26 @@ def run_evaluation_phase(
         stage="testing",
         global_step=epochs[-1].global_step,
     )
-    _, predictions = _run_one_formal_evaluation(
+    selected_metrics, selected_predictions = _run_one_formal_evaluation(
         prepared,
         selected,
         split="test",
         selection_proof=proof,
         runner=runner,
     )
-    comparison = _write_v24_comparison(prepared, selected, predictions)
+    baseline, baseline_metrics, baseline_predictions = _run_zero_shot_baseline(
+        prepared,
+        runner=runner,
+    )
+    comparison = _write_zero_shot_comparison(
+        prepared,
+        selected,
+        selected_metrics=selected_metrics,
+        selected_predictions=selected_predictions,
+        baseline=baseline,
+        baseline_metrics=baseline_metrics,
+        baseline_predictions=baseline_predictions,
+    )
     _advance_run_state(
         prepared,
         stage="complete",
@@ -2131,7 +2231,8 @@ def run_evaluation_phase(
         selected_epoch=selected.epoch,
         selected_checkpoint_fingerprint=selected.checkpoint_fingerprint,
         test_evaluated=True,
-        v24_comparison=str(comparison),
+        zero_shot_baseline_evaluated=True,
+        zero_shot_comparison=str(comparison),
     )
     return selected
 

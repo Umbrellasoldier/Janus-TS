@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 
@@ -58,6 +58,7 @@ TEST_COMPLETION_SCHEMA_VERSION = "janus-ts-test-evaluation-complete-v1"
 EXPECTED_FORMAL_SPLIT_COUNTS = {"val": 994, "test": 996}
 FORMAL_WORLD_SIZE = 2
 FORMAL_NUM_BEAMS = 10
+FormalTestRole = Literal["selected_checkpoint", "frozen_zero_shot"]
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -950,6 +951,7 @@ def run_formal_generation(
     output_dir: str | Path,
     eval_loss: EvalLossSource | None = None,
     selection_proof_path: str | Path | None = None,
+    test_role: FormalTestRole = "selected_checkpoint",
     distributed: DistributedContext | None = None,
 ) -> FormalEvaluationResult | None:
     """Generate/evaluate val or the selected checkpoint's one test pass.
@@ -969,7 +971,11 @@ def run_formal_generation(
     rank = context.rank
     rank_shard_bounds(len(reactions), rank=rank, world_size=context.world_size)
 
+    if test_role not in ("selected_checkpoint", "frozen_zero_shot"):
+        raise GenerationContractError(f"invalid formal test role: {test_role!r}")
     if identity.split == "val":
+        if test_role != "selected_checkpoint":
+            raise GenerationContractError("validation cannot use a test-only model role")
         if eval_loss is None:
             raise GenerationContractError("formal validation requires eval_loss")
         resolved_eval_loss = resolve_eval_loss(eval_loss)
@@ -977,11 +983,18 @@ def run_formal_generation(
     else:
         if eval_loss is not None:
             raise GenerationContractError("test evaluation must not compute checkpoint eval_loss")
-        if selection_proof_path is None:
-            raise GenerationContractError(
-                "test evaluation requires the locked checkpoint selection proof"
-            )
-        proof = load_selection_proof(selection_proof_path, identity)
+        if test_role == "selected_checkpoint":
+            if selection_proof_path is None:
+                raise GenerationContractError(
+                    "selected-checkpoint test evaluation requires the locked selection proof"
+                )
+            proof = load_selection_proof(selection_proof_path, identity)
+        else:
+            if selection_proof_path is not None:
+                raise GenerationContractError(
+                    "frozen zero-shot test evaluation must not receive a selection proof"
+                )
+            proof = None
         resolved_eval_loss = None
 
     lease: TestEvaluationLease | None = None
@@ -1056,9 +1069,10 @@ def run_formal_generation(
             eval_loss=resolved_eval_loss,
         )
         if lease is not None:
-            # ``proof`` is loaded above on both ranks; retaining this assertion
-            # prevents future refactors from bypassing the selection gate.
-            if proof is None:
+            # A trained checkpoint needs its locked selection proof.  The
+            # separately fingerprinted zero-shot model is fixed before any
+            # test prediction and therefore has no checkpoint-selection proof.
+            if test_role == "selected_checkpoint" and proof is None:
                 raise GenerationContractError("test selection proof was not retained")
             lease.complete(
                 predictions_path=predictions,
@@ -1075,6 +1089,7 @@ __all__ = [
     "EXPECTED_FORMAL_SPLIT_COUNTS",
     "FORMAL_NUM_BEAMS",
     "FORMAL_WORLD_SIZE",
+    "FormalTestRole",
     "GenerationContractError",
     "GenerationIdentity",
     "GenerationRow",

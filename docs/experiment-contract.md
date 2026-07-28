@@ -11,8 +11,9 @@ must never silently alter an in-progress run.
 - Base model: `Qwen/Qwen3.6-27B` at commit
   `6a9e13bd6fc8f0983b9b99948120bc37f49c13e9`, text decoder only.
 - Formal training runs on both RTX 4090 GPUs on `gu30` with seed 42.
-- The only historical comparison is the exact Chemformer/ReactionT5v2 v24
-  checkpoint 413820; no heuristic or additional model baseline is run.
+- The sole baseline is the same pinned original Qwen model evaluated zero-shot:
+  no adapter, no training update, and no demonstration. No historical model
+  result is loaded, evaluated, retained, or reported.
 
 ## Data
 
@@ -196,10 +197,14 @@ next epoch. After locking the selected checkpoint, the 996-example test set is
 evaluated once. Optional thinking inference is a separately labeled
 exploratory profile and cannot affect formal selection.
 
-The v24 comparison is computed only after Qwen selection, on the exact common
-102-reaction test intersection under the new 0.1-discretized gold labels and
-the same metrics. Frozen v24 prediction SHA256:
-`11e4eea54a1f2d5e45af003a3607fca75fc670fdb96b35ef7fa38b10cf34bc3c`.
+After Qwen checkpoint selection is locked, the original pinned
+`Qwen/Qwen3.6-27B` text model is loaded directly in BF16 without PiSSA or LoRA
+and evaluated zero-shot on the same complete 996-example test split. It uses
+the identical `MoleCode-TS/v1` system prompt and input, non-thinking mode,
+beam 10, 512-token limit, strict parser, and @1/@2/@3/@4/@5/@10 metrics. The
+zero-shot result cannot participate in checkpoint selection. The final report
+places the selected fine-tuned model and zero-shot Qwen side by side; no
+historical-comparison artifact or partial test intersection is produced.
 
 ## Persistence and host safety
 
