@@ -4,7 +4,7 @@ index 0029359..36a2e41 100644
 +++ b/setup.py
 @@ -144,25 +144,9 @@ if not SKIP_CUDA_BUILD:
                  )
-
+ 
 -        cc_flag.append("-gencode")
 -        cc_flag.append("arch=compute_75,code=sm_75")
 -        cc_flag.append("-gencode")
@@ -30,5 +30,5 @@ index 0029359..36a2e41 100644
 +        # deployed architecture also keeps the locally reproducible wheel
 +        # compact enough for the project uv environment.
 +        cc_flag.extend(["-gencode", "arch=compute_89,code=sm_89"])
-
+ 
      # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
