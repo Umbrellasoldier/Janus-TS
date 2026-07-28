@@ -27,6 +27,63 @@ from .training import (
 TINY_LORA_PARAMETERS = 256
 
 
+def snapshot_trainable_zero3_shards(model: Any) -> dict[str, Any]:
+    """Clone every trainable ZeRO shard without relying on PEFT name shapes."""
+
+    snapshots: dict[str, Any] = {}
+    missing_shards: list[str] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        shard = getattr(parameter, "ds_tensor", None)
+        if shard is None:
+            missing_shards.append(name)
+            continue
+        snapshots[name] = shard.detach().clone()
+    if missing_shards:
+        raise RuntimeError(f"trainable parameters have no ZeRO shard: {missing_shards!r}")
+    if not snapshots:
+        raise RuntimeError("the dtype gate found no trainable ZeRO shards to snapshot")
+    return snapshots
+
+
+def measure_trainable_zero3_shard_updates(
+    model: Any,
+    before_shards: dict[str, Any],
+) -> tuple[list[str], float]:
+    """Return changed trainable shard names and their largest absolute delta."""
+
+    after_shards = {
+        name: parameter.ds_tensor
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and getattr(parameter, "ds_tensor", None) is not None
+    }
+    before_names = set(before_shards)
+    after_names = set(after_shards)
+    if before_names != after_names:
+        raise RuntimeError(
+            "trainable ZeRO shard names changed across the optimizer step: "
+            f"before={sorted(before_names)!r}, after={sorted(after_names)!r}"
+        )
+
+    changed_names: list[str] = []
+    max_abs_delta = 0.0
+    for name in sorted(before_names):
+        before = before_shards[name]
+        after = after_shards[name]
+        if before.shape != after.shape:
+            raise RuntimeError(
+                f"trainable ZeRO shard shape changed for {name}: "
+                f"before={tuple(before.shape)!r}, after={tuple(after.shape)!r}"
+            )
+        if not after.equal(before):
+            changed_names.append(name)
+        if after.numel():
+            delta = float((after.detach().float() - before.float()).abs().max())
+            max_abs_delta = max(max_abs_delta, delta)
+    return changed_names, max_abs_delta
+
+
 def build_tiny_zero3_dtype_gate_config() -> dict[str, Any]:
     """Return the minimal runtime config matching the full training phase."""
 
@@ -115,11 +172,7 @@ def _run_gate(output: Path) -> None:
         expected_trainable_parameters=TINY_LORA_PARAMETERS,
         require_optimizer_states=False,
     )
-    before_shards = {
-        name: parameter.ds_tensor.detach().clone()
-        for name, parameter in engine.module.named_parameters()
-        if ".lora_A." in name or ".lora_B." in name
-    }
+    before_shards = snapshot_trainable_zero3_shards(engine.module)
 
     inputs = torch.randn(2, 32, device=engine.device, dtype=torch.bfloat16)
     engine.train()
@@ -133,12 +186,10 @@ def _run_gate(output: Path) -> None:
         expected_trainable_parameters=TINY_LORA_PARAMETERS,
         require_optimizer_states=True,
     )
-    changed = any(
-        not torch.equal(before_shards[name], parameter.ds_tensor)
-        for name, parameter in engine.module.named_parameters()
-        if name in before_shards
+    changed_names, max_abs_delta = measure_trainable_zero3_shard_updates(
+        engine.module, before_shards
     )
-    if not changed:
+    if not changed_names:
         raise RuntimeError("the optimizer update did not change any FP32 LoRA shard")
     if observed_output_dtypes != [str(torch.bfloat16), str(torch.bfloat16)]:
         raise RuntimeError(f"LoRA Linear compute did not use BF16: {observed_output_dtypes!r}")
@@ -148,7 +199,9 @@ def _run_gate(output: Path) -> None:
         "local_rank": local_rank,
         "loss": float(loss.detach()),
         "lora_linear_output_dtypes": observed_output_dtypes,
-        "adapter_updated": changed,
+        "adapter_updated": True,
+        "changed_names": changed_names,
+        "max_abs_delta": max_abs_delta,
         "before": before_report,
         "after": after_report,
     }

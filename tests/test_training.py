@@ -8,7 +8,11 @@ from test_tokenization import FakeTokenizer, reaction_record
 from torch import nn
 
 from janus_ts.config import load_config
-from janus_ts.dtype_gate import build_tiny_zero3_dtype_gate_config
+from janus_ts.dtype_gate import (
+    build_tiny_zero3_dtype_gate_config,
+    measure_trainable_zero3_shard_updates,
+    snapshot_trainable_zero3_shards,
+)
 from janus_ts.tokenization import EpochAwareTokenizedDataset, QwenTrainingEncoder
 from janus_ts.training import (
     DatasetEpochCallback,
@@ -229,6 +233,40 @@ def test_two_rank_dtype_gate_config_uses_runtime_autocast_contract():
     assert gate["zero_optimization"]["stage"] == 3
     assert gate["zero_optimization"]["offload_optimizer"]["device"] == "none"
     assert gate["zero_optimization"]["offload_param"]["device"] == "none"
+
+
+def test_dtype_gate_tracks_top_level_trainable_zero3_shards_without_name_matching():
+    model = TinyMixedDtypeModel()
+    for parameter in model.parameters():
+        parameter.ds_tensor = parameter.detach().clone()
+
+    before = snapshot_trainable_zero3_shards(model)
+    assert set(before) == {"lora_A.default.weight", "lora_B.default.weight"}
+
+    model.lora_B["default"].weight.ds_tensor[0, 0].add_(0.125)
+    changed_names, max_abs_delta = measure_trainable_zero3_shard_updates(model, before)
+
+    assert changed_names == ["lora_B.default.weight"]
+    assert max_abs_delta == pytest.approx(0.125)
+
+
+def test_dtype_gate_rejects_an_empty_trainable_zero3_snapshot():
+    model = TinyMixedDtypeModel()
+    model.requires_grad_(False)
+
+    with pytest.raises(RuntimeError, match="no trainable ZeRO shards"):
+        snapshot_trainable_zero3_shards(model)
+
+
+def test_dtype_gate_requires_the_same_trainable_shards_after_step():
+    model = TinyMixedDtypeModel()
+    for parameter in model.parameters():
+        parameter.ds_tensor = parameter.detach().clone()
+    before = snapshot_trainable_zero3_shards(model)
+    model.lora_B["default"].weight.requires_grad_(False)
+
+    with pytest.raises(RuntimeError, match="shard names changed"):
+        measure_trainable_zero3_shard_updates(model, before)
 
 
 def test_accelerate_plugin_selects_post_switch_config_without_gpu():
