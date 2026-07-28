@@ -104,7 +104,7 @@ def test_frozen_training_argument_contract():
     assert kwargs["warmup_steps"] == 0.05
     assert kwargs["optim"] == "adamw_torch"
     assert kwargs["bf16"] is True and kwargs["fp16"] is False
-    assert kwargs["gradient_checkpointing_kwargs"] == {"use_reentrant": False}
+    assert kwargs["gradient_checkpointing_kwargs"] == {"use_reentrant": True}
     assert kwargs["average_tokens_across_devices"] is True
     assert kwargs["save_strategy"] == "steps" and kwargs["save_steps"] == 50
     assert kwargs["save_total_limit"] == 2
@@ -125,6 +125,16 @@ def test_frozen_training_argument_contract():
     )
     assert candidate["per_device_train_batch_size"] == 2
     assert candidate["gradient_accumulation_steps"] == 4
+
+    nonreentrant = config.model_copy(
+        update={
+            "train": config.train.model_copy(
+                update={"gradient_checkpointing_use_reentrant": False}
+            )
+        }
+    )
+    with pytest.raises(TrainingContractError, match="reentrant"):
+        build_training_argument_kwargs(nonreentrant, output_dir="artifacts/runs/test")
 
     with pytest.raises(TrainingContractError, match="unconfirmed batch geometry"):
         build_training_argument_kwargs(

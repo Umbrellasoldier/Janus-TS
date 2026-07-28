@@ -226,7 +226,7 @@ def test_post_engine_callback_checks_engine_then_initialized_optimizer(monkeypat
     model = SimpleNamespace(
         config=SimpleNamespace(use_cache=False),
         _janus_ts_input_grads_enabled=True,
-        _janus_ts_nonreentrant_gc_enabled=True,
+        _janus_ts_reentrant_gc_enabled=True,
     )
     engine = SimpleNamespace(module=model)
     monkeypatch.setattr(
@@ -307,9 +307,20 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
         lambda arguments, value: {"phase": "training"},
     )
 
+    with pytest.raises(DistributedTrainingError, match="reentrant"):
+        distributed.load_zero3_prepared_model(
+            bundle,
+            SimpleNamespace(gradient_checkpointing_kwargs={"use_reentrant": False}),
+            torch_module=torch,
+            base_loader=lambda **kwargs: pytest.fail("base load must not start"),
+            adapter_loader=adapter_loader,
+            require_complete=False,
+        )
+    assert calls == {}
+
     loaded = distributed.load_zero3_prepared_model(
         bundle,
-        SimpleNamespace(),
+        SimpleNamespace(gradient_checkpointing_kwargs={"use_reentrant": True}),
         torch_module=torch,
         base_loader=base_loader,
         adapter_loader=adapter_loader,
@@ -328,7 +339,7 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
     }
     assert model.events == [
         "input-grads",
-        ("checkpointing", {"gradient_checkpointing_kwargs": {"use_reentrant": False}}),
+        ("checkpointing", {"gradient_checkpointing_kwargs": {"use_reentrant": True}}),
         "train",
     ]
     assert model.config.use_cache is False

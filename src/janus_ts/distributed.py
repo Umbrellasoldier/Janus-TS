@@ -303,8 +303,8 @@ class PostEngineModelContractCallback(TrainerCallback):
             raise DistributedTrainingError("use_cache must remain false during training")
         if getattr(model, "_janus_ts_input_grads_enabled", None) is not True:
             raise DistributedTrainingError("input gradients were not enabled")
-        if getattr(model, "_janus_ts_nonreentrant_gc_enabled", None) is not True:
-            raise DistributedTrainingError("non-reentrant gradient checkpointing was not enabled")
+        if getattr(model, "_janus_ts_reentrant_gc_enabled", None) is not True:
+            raise DistributedTrainingError("reentrant gradient checkpointing was not enabled")
 
     def on_train_begin(
         self,
@@ -514,6 +514,11 @@ def load_zero3_prepared_model(
     """
 
     assert_zero3_no_offload(arguments)
+    checkpointing_kwargs = getattr(arguments, "gradient_checkpointing_kwargs", None)
+    if checkpointing_kwargs != {"use_reentrant": True}:
+        raise DistributedTrainingError(
+            "ZeRO-3 training requires frozen reentrant gradient checkpointing"
+        )
     if torch_module is None:
         import torch as torch_module
 
@@ -605,9 +610,11 @@ def load_zero3_prepared_model(
         generation_config.pad_token_id = QWEN_PAD_TOKEN_ID
         generation_config.eos_token_id = QWEN_IM_END_TOKEN_ID
     model.enable_input_require_grads()
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs=dict(checkpointing_kwargs)
+    )
     model._janus_ts_input_grads_enabled = True
-    model._janus_ts_nonreentrant_gc_enabled = True
+    model._janus_ts_reentrant_gc_enabled = True
     model.train()
     assert_pissa_adapter_contract(model)
     assert_model_precision_and_freezing(model, torch_module)

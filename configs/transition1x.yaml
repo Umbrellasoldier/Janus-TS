@@ -57,7 +57,7 @@ train:
   candidate_gradient_accumulation_steps: 4
   global_batch_size: 16
   gradient_checkpointing: true
-  gradient_checkpointing_use_reentrant: false
+  gradient_checkpointing_use_reentrant: true
   average_tokens_across_devices: true
   checkpoint_steps: 50
   keep_local_checkpoints: 2

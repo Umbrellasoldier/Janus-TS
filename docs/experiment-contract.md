@@ -121,8 +121,15 @@ disk-backed and content-addressed; no truncation is permitted.
   = global batch 16. Microbatch 2 / accumulation 4 is selected only if the
   worst 2,048-token smoke stays within 44 GiB per GPU with no material swap
   growth.
-- ZeRO-3 without CPU/NVMe offload, non-reentrant activation checkpointing,
-  `use_cache=false`, global supervised-token-normalized loss, and no W&B.
+- ZeRO-3 without CPU/NVMe offload, reentrant activation checkpointing,
+  `use_cache=false`, global supervised-token-normalized loss, and no W&B. The
+  reentrant variant is required by the locked DeepSpeed 0.19.2/PyTorch 2.9.1
+  combination: a real 2,048-token two-rank smoke showed that non-reentrant
+  recomputation observed already-partitioned frozen weights as shape `[0]`
+  after the original forward had saved their full shapes. Qwen passes its
+  checkpointed hidden state positionally, input gradients are explicitly
+  enabled, every decoder layer is checkpointed once, and unused-parameter
+  discovery is disabled, satisfying the reentrant variant's constraints.
 - Linear-attention kernels use FLA; full-attention layers use SDPA. Kernel
   lengths 63/64/65, two-rank NCCL, ZeRO-3, resume, and portable-adapter parity
   are hard launch gates.

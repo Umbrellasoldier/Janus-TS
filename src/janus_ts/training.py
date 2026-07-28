@@ -458,6 +458,10 @@ def build_training_argument_kwargs(
         )
     if config.seed != SEED:
         raise TrainingContractError(f"seed must remain frozen at {SEED}")
+    if not train.gradient_checkpointing or not train.gradient_checkpointing_use_reentrant:
+        raise TrainingContractError(
+            "ZeRO-3 training requires reentrant activation checkpointing"
+        )
     if not train.average_tokens_across_devices:
         raise TrainingContractError("global supervised-token normalization must remain enabled")
 
