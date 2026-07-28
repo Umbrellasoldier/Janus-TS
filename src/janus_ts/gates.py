@@ -23,8 +23,12 @@ from .runtime import (
 )
 from .snapshot import audit_snapshot
 
-PISSA_PARITY_ATOL = 0.125
-PISSA_PARITY_RTOL = 0.02
+PISSA_PARITY_TOP_K = 32
+PISSA_PARITY_MIN_TOP_K_OVERLAP = 0.90
+PISSA_PARITY_MAX_TOTAL_VARIATION = 0.05
+PISSA_PARITY_MAX_JENSEN_SHANNON = 0.002
+PISSA_PARITY_MAX_PROBABILITY_DELTA = 0.02
+PISSA_PARITY_MAX_CENTERED_NRMSE = 0.05
 
 
 class GateError(RuntimeError):
@@ -102,6 +106,105 @@ class _PissaLoraOutputProbe:
         return evidence
 
 
+def _pissa_parity_policy() -> dict[str, Any]:
+    return {
+        "name": "bf16-behavioral-distribution-v1",
+        "top_k": PISSA_PARITY_TOP_K,
+        "min_top_k_overlap": PISSA_PARITY_MIN_TOP_K_OVERLAP,
+        "max_total_variation": PISSA_PARITY_MAX_TOTAL_VARIATION,
+        "max_jensen_shannon": PISSA_PARITY_MAX_JENSEN_SHANNON,
+        "max_probability_delta": PISSA_PARITY_MAX_PROBABILITY_DELTA,
+        "max_centered_nrmse": PISSA_PARITY_MAX_CENTERED_NRMSE,
+        "requires_exact_argmax": True,
+    }
+
+
+def _pissa_behavioral_metrics(reference: Any, candidate: Any) -> dict[str, Any]:
+    """Measure BF16 reconstruction error in generation-relevant coordinates."""
+
+    import math
+
+    import torch
+
+    left = torch.as_tensor(reference).detach().cpu().float().flatten().contiguous()
+    right = torch.as_tensor(candidate).detach().cpu().float().flatten().contiguous()
+    if left.numel() == 0 or right.shape != left.shape:
+        raise GateError(
+            f"PiSSA parity logits have invalid shapes: {tuple(left.shape)} / {tuple(right.shape)}"
+        )
+    if not bool(torch.isfinite(left).all()) or not bool(torch.isfinite(right).all()):
+        raise GateError("PiSSA behavioral parity logits contain NaN or infinity")
+
+    difference = right - left
+    absolute = difference.abs()
+    centered_left = left - left.mean()
+    centered_difference = difference - difference.mean()
+    reference_rms = torch.sqrt(torch.mean(centered_left.square()))
+    centered_rmse = torch.sqrt(torch.mean(centered_difference.square()))
+    centered_nrmse = centered_rmse / reference_rms.clamp_min(torch.finfo(torch.float32).eps)
+
+    log_left = torch.log_softmax(left, dim=-1)
+    log_right = torch.log_softmax(right, dim=-1)
+    left_probability = log_left.exp()
+    right_probability = log_right.exp()
+    log_midpoint = torch.logaddexp(log_left, log_right) - math.log(2.0)
+    jensen_shannon = (
+        0.5
+        * (
+            torch.sum(left_probability * (log_left - log_midpoint))
+            + torch.sum(right_probability * (log_right - log_midpoint))
+        )
+    ).clamp_min(0.0)
+    probability_difference = (right_probability - left_probability).abs()
+
+    top_k = min(PISSA_PARITY_TOP_K, int(left.numel()))
+    left_top = torch.topk(left, top_k, sorted=True).indices.tolist()
+    right_top = torch.topk(right, top_k, sorted=True).indices.tolist()
+    overlap_count = len(set(left_top) & set(right_top))
+    left_argmax = int(left.argmax().item())
+    right_argmax = int(right.argmax().item())
+    return {
+        "vocabulary_size": int(left.numel()),
+        "reference_argmax": left_argmax,
+        "candidate_argmax": right_argmax,
+        "argmax_equal": left_argmax == right_argmax,
+        "top_k": top_k,
+        "top_k_overlap_count": overlap_count,
+        "top_k_overlap": overlap_count / top_k,
+        "reference_top_k_token_ids": left_top,
+        "candidate_top_k_token_ids": right_top,
+        "total_variation": float(0.5 * probability_difference.sum()),
+        "jensen_shannon": float(jensen_shannon),
+        "max_probability_delta": float(probability_difference.max()),
+        "centered_nrmse": float(centered_nrmse),
+        "max_abs": float(absolute.max()),
+        "mean_abs": float(absolute.mean()),
+        "centered_rmse": float(centered_rmse),
+        "reference_centered_rms": float(reference_rms),
+    }
+
+
+def _assert_pissa_behavioral_parity(metrics: dict[str, Any], *, stage: str) -> None:
+    failures: list[str] = []
+    if not metrics["argmax_equal"]:
+        failures.append("argmax changed")
+    if metrics["top_k_overlap"] < PISSA_PARITY_MIN_TOP_K_OVERLAP:
+        failures.append("top-k overlap below minimum")
+    if metrics["total_variation"] > PISSA_PARITY_MAX_TOTAL_VARIATION:
+        failures.append("total variation above maximum")
+    if metrics["jensen_shannon"] > PISSA_PARITY_MAX_JENSEN_SHANNON:
+        failures.append("Jensen-Shannon divergence above maximum")
+    if metrics["max_probability_delta"] > PISSA_PARITY_MAX_PROBABILITY_DELTA:
+        failures.append("maximum token-probability delta above maximum")
+    if metrics["centered_nrmse"] > PISSA_PARITY_MAX_CENTERED_NRMSE:
+        failures.append("centered logit NRMSE above maximum")
+    if failures:
+        raise GateError(
+            f"PiSSA behavioral parity failed at {stage}: {', '.join(failures)}; "
+            f"metrics={metrics!r}; policy={_pissa_parity_policy()!r}"
+        )
+
+
 class PissaParityProbe:
     """Three-stage untouched/PiSSA/reload logit comparison.
 
@@ -166,32 +269,19 @@ class PissaParityProbe:
             raise GateError(f"non-finite PiSSA probe logits at {stage}")
         if stage == "original_base":
             self._reference = logits
-            result.update({"reference": True, "atol": PISSA_PARITY_ATOL, "rtol": PISSA_PARITY_RTOL})
+            result.update({"reference": True, "parity_policy": _pissa_parity_policy()})
             return result
         if self._reference is None:
             raise GateError(f"PiSSA parity stage {stage!r} ran before original_base")
-        difference = (logits - self._reference).abs()
+        metrics = _pissa_behavioral_metrics(self._reference, logits)
         result.update(
             {
                 "reference": False,
-                "max_abs": float(difference.max()),
-                "mean_abs": float(difference.mean()),
-                "argmax_equal": bool(logits.argmax() == self._reference.argmax()),
-                "atol": PISSA_PARITY_ATOL,
-                "rtol": PISSA_PARITY_RTOL,
+                **metrics,
+                "parity_policy": _pissa_parity_policy(),
             }
         )
-        try:
-            torch.testing.assert_close(
-                logits,
-                self._reference,
-                atol=PISSA_PARITY_ATOL,
-                rtol=PISSA_PARITY_RTOL,
-            )
-        except AssertionError as exc:
-            raise GateError(f"PiSSA probe parity failed at {stage}: {result!r}") from exc
-        if not result["argmax_equal"]:
-            raise GateError(f"PiSSA probe argmax changed at {stage}: {result!r}")
+        _assert_pissa_behavioral_parity(metrics, stage=stage)
         return result
 
 
@@ -295,8 +385,12 @@ def complete_gate_directory(output_dir: str | Path, reports: dict[str, Any]) -> 
 
 __all__ = [
     "GateError",
-    "PISSA_PARITY_ATOL",
-    "PISSA_PARITY_RTOL",
+    "PISSA_PARITY_MAX_CENTERED_NRMSE",
+    "PISSA_PARITY_MAX_JENSEN_SHANNON",
+    "PISSA_PARITY_MAX_PROBABILITY_DELTA",
+    "PISSA_PARITY_MAX_TOTAL_VARIATION",
+    "PISSA_PARITY_MIN_TOP_K_OVERLAP",
+    "PISSA_PARITY_TOP_K",
     "PissaParityProbe",
     "complete_gate_directory",
     "pissa_bundle_path",

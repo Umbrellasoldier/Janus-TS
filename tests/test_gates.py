@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from janus_ts.gates import GateError, PissaParityProbe
+from janus_ts.gates import (
+    GateError,
+    PissaParityProbe,
+    _assert_pissa_behavioral_parity,
+    _pissa_behavioral_metrics,
+)
 
 
 class _Tokenizer:
@@ -67,5 +72,33 @@ def test_pissa_parity_still_fails_closed_on_changed_argmax() -> None:
     probe = PissaParityProbe(_Tokenizer())
     probe("original_base", _ParityModel(adapter=False))
 
-    with pytest.raises(GateError, match="parity failed|argmax changed"):
+    with pytest.raises(GateError, match="behavioral parity failed.*argmax changed"):
         probe("pissa_initialized", _ParityModel(adapter=True, changed_argmax=True))
+
+
+def test_pissa_behavioral_parity_is_invariant_to_global_logit_shift() -> None:
+    reference = torch.tensor([-4.0, -1.0, 0.5, 3.0, 1.0])
+    metrics = _pissa_behavioral_metrics(reference, reference + 2.0)
+
+    _assert_pissa_behavioral_parity(metrics, stage="test")
+    assert metrics["argmax_equal"] is True
+    assert metrics["total_variation"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["jensen_shannon"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["centered_nrmse"] == pytest.approx(0.0, abs=1e-7)
+    assert metrics["mean_abs"] == pytest.approx(2.0)
+
+
+def test_pissa_behavioral_parity_rejects_distribution_and_ranking_drift() -> None:
+    reference = torch.linspace(-4.0, 4.0, 64)
+    changed = reference.flip(0)
+    metrics = _pissa_behavioral_metrics(reference, changed)
+
+    with pytest.raises(GateError, match="argmax changed.*top-k overlap"):
+        _assert_pissa_behavioral_parity(metrics, stage="test")
+
+
+def test_pissa_behavioral_metrics_reject_nonfinite_or_shape_drift() -> None:
+    with pytest.raises(GateError, match="invalid shapes"):
+        _pissa_behavioral_metrics(torch.ones(4), torch.ones(3))
+    with pytest.raises(GateError, match="NaN or infinity"):
+        _pissa_behavioral_metrics(torch.ones(4), torch.tensor([1.0, 2.0, 3.0, float("nan")]))

@@ -105,6 +105,15 @@ disk-backed and content-addressed; no truncation is permitted.
 - Exact LoRA coverage: 496 projections across all 64 layers. Rank 32,
   alpha 16, rsLoRA enabled, dropout 0, bias none, PiSSA `pissa_niter_16`.
   Expected trainable parameter count: 233,455,616.
+- PiSSA initialization and residual reload are compared with the untouched
+  checkpoint under the same explicit BF16 autocast used by training. LoRA A/B
+  and final-logit BF16 dtypes, finite logits, and exact argmax equality are
+  mandatory. Behavioral parity additionally requires at least 90% overlap of
+  the top 32 tokens, total-variation distance at most 0.05, Jensen-Shannon
+  divergence at most 0.002 nats, maximum single-token probability change at
+  most 0.02, and centered-logit NRMSE at most 0.05. Raw maximum and mean
+  absolute logit errors remain recorded diagnostics; pointwise relative error
+  near zero and softmax-invariant global logit shifts are not gate criteria.
 - AdamW (`adamw_torch`), learning rate 1e-4, betas (0.9, 0.999), epsilon 1e-8,
   weight decay 0, cosine schedule, warmup ratio 0.05, max gradient norm 1.
 - Five epochs. Default geometry is microbatch 1/GPU x 2 GPUs x accumulation 8
