@@ -1,8 +1,8 @@
 """Content-addressed gu30 orchestration for the frozen Transition1x run.
 
 This module is deliberately a thin process supervisor, not a second trainer.
-Every CUDA-heavy operation runs in an isolated two-rank ``torchrun`` process,
-under the project GPU lock and after a fresh foreign-process check.  Durable
+Every CUDA-heavy operation runs in an isolated two-rank ``torchrun`` process
+under the project GPU lock. Durable
 ordering comes only from content identities, explicit global steps, and
 completion markers; the gu30 wall clock and filesystem mtimes are never used.
 """
@@ -67,10 +67,7 @@ from .run_state import (
 )
 from .runtime import (
     ResourceUnavailableError,
-    approved_external_gpu_pids,
     assert_host_ready,
-    audit_external_gpu_allowlist,
-    descendant_pids,
     exclusive_lock,
     frozen_distributed_environment,
     install_frozen_environment,
@@ -416,7 +413,6 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
     v24_source = audit_v24_source(
         current_test_ids=tuple(processed_dataset["test"]["reaction_id"])
     )
-    gpu_share_allowlist = audit_external_gpu_allowlist()
     report = {
         "schema_version": WORKFLOW_SCHEMA_VERSION,
         "status": "pass",
@@ -426,10 +422,9 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
         "snapshot": snapshot,
         "native_stack": native,
         "v24_source": v24_source,
-        "gpu_share_allowlist": gpu_share_allowlist,
         "host_policy": (
-            "live resources are rechecked immediately before every GPU phase; "
-            "only the identity-bound one-time external GPU allowlist may coexist"
+            "GPU sharing is allowed; host memory and whole-device peak GPU memory "
+            "are checked independently"
         ),
     }
     launch_fingerprint = sha256_json(
@@ -442,7 +437,6 @@ def run_cpu_audits(config_path: str | Path) -> CpuAuditResult:
             "snapshot_critical_sha256": snapshot["critical_sha256"],
             "native_stack": native,
             "v24_source": v24_source,
-            "gpu_share_allowlist": gpu_share_allowlist,
         }
     )
     return CpuAuditResult(
@@ -459,12 +453,6 @@ def _subprocess_environment() -> dict[str, str]:
     environment = dict(os.environ)
     environment.update(frozen_distributed_environment())
     return environment
-
-
-def _allowed_gpu_pids(owned_pids: Sequence[int]) -> tuple[int, ...]:
-    """Combine this launch tree with the fixed, live-validated sharing exception."""
-
-    return tuple(sorted(set(owned_pids) | set(approved_external_gpu_pids())))
 
 
 def run_delegated_command(
@@ -524,7 +512,6 @@ def run_locked_gpu_command(
     with exclusive_lock(lock_path):
         assert_host_ready(
             required_gpu_count=required_gpu_count,
-            allowed_pids=_allowed_gpu_pids(tuple(descendant_pids())),
         )
         try:
             return run_delegated_command(
@@ -540,7 +527,6 @@ def run_locked_gpu_command(
                 # remain on either GPU after torchrun has returned or timed out.
                 assert_host_ready(
                     required_gpu_count=required_gpu_count,
-                    allowed_pids=_allowed_gpu_pids((os.getpid(),)),
                 )
 
 
@@ -580,7 +566,6 @@ def _run_kernel_gate(
     with exclusive_lock(cpu.config.runtime.gpu_lock_path):
         assert_host_ready(
             required_gpu_count=cpu.config.runtime.required_gpu_count,
-            allowed_pids=_allowed_gpu_pids(tuple(descendant_pids())),
         )
         outcome = run_delegated_command(
             "kernel-gate",
@@ -591,7 +576,6 @@ def _run_kernel_gate(
         )
         assert_host_ready(
             required_gpu_count=cpu.config.runtime.required_gpu_count,
-            allowed_pids=_allowed_gpu_pids((os.getpid(),)),
         )
     _require_success(outcome)
     report = _read_json(raw_report)

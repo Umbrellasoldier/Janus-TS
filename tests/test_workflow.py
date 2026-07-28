@@ -220,7 +220,7 @@ def test_delegated_failure_classification_and_gate_timeout(monkeypatch):
         )
 
 
-def test_locked_gpu_phase_checks_before_and_after_without_killing(tmp_path: Path, monkeypatch):
+def test_locked_gpu_phase_checks_host_before_and_after(tmp_path: Path, monkeypatch):
     events: list[object] = []
 
     @contextmanager
@@ -229,13 +229,11 @@ def test_locked_gpu_phase_checks_before_and_after_without_killing(tmp_path: Path
         yield
 
     def gate(**kwargs):
-        events.append(("gate", kwargs["allowed_pids"]))
+        events.append(("gate", kwargs["required_gpu_count"]))
         return object()
 
     monkeypatch.setattr(workflow, "exclusive_lock", lock)
     monkeypatch.setattr(workflow, "assert_host_ready", gate)
-    monkeypatch.setattr(workflow, "descendant_pids", lambda: {10, 11})
-    monkeypatch.setattr(workflow, "approved_external_gpu_pids", lambda: (20, 21))
     outcome = workflow.run_locked_gpu_command(
         "phase",
         ("/bin/true",),
@@ -243,8 +241,8 @@ def test_locked_gpu_phase_checks_before_and_after_without_killing(tmp_path: Path
         runner=lambda command, **kwargs: subprocess.CompletedProcess(command, 0),
     )
     assert outcome.returncode == 0
-    assert events[1] == ("gate", (10, 11, 20, 21))
-    assert events[2] == ("gate", tuple(sorted((os.getpid(), 20, 21))))
+    assert events[1] == ("gate", 2)
+    assert events[2] == ("gate", 2)
 
 
 def test_default_delegation_uses_an_owned_process_group():
@@ -845,7 +843,7 @@ def test_train_smoke_typer_command_is_mockable_and_reports_selection(monkeypatch
 
 def test_train_smoke_maps_only_resource_failure_to_exit_75(monkeypatch):
     def busy(config):
-        raise ResourceUnavailableError("foreign process")
+        raise ResourceUnavailableError("MemAvailable is low")
 
     monkeypatch.setattr(workflow, "prepare_smoke_workflow", busy)
     result = CliRunner().invoke(

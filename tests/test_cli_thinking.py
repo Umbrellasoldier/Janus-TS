@@ -81,14 +81,14 @@ def test_thinking_cli_builds_absolute_locked_two_rank_launch(
     assert captured["require_clean_after"] is True
 
 
-def test_thinking_cli_maps_busy_gpu_gate_to_transient_exit(
+def test_thinking_cli_maps_resource_gate_to_transient_exit(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     processed, checkpoint, output = _input_directories(tmp_path)
 
     def busy(*args, **kwargs):
-        raise ResourceUnavailableError("foreign GPU process")
+        raise ResourceUnavailableError("MemAvailable is low")
 
     monkeypatch.setattr(workflow, "run_locked_gpu_command", busy)
     result = CliRunner().invoke(

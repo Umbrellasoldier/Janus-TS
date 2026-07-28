@@ -14,9 +14,7 @@ from .modeling import (
 )
 from .native_stack import audit_native_stack
 from .runtime import (
-    approved_external_gpu_pids,
     assert_host_ready,
-    descendant_pids,
     exclusive_lock,
     host_status,
     install_frozen_environment,
@@ -357,13 +355,10 @@ def prepare_pissa_gate(
     install_frozen_environment()
     destination = pissa_bundle_path(local_cache_root)
     with exclusive_lock(gpu_lock_path):
-        allowed = tuple(
-            sorted(set(descendant_pids()) | set(approved_external_gpu_pids()))
-        )
-        before = assert_host_ready(allowed_pids=allowed)
+        before = assert_host_ready()
         if destination.exists():
             manifest = verify_bundle_payload(destination)
-            after = assert_host_ready(allowed_pids=allowed)
+            after = assert_host_ready()
             resources = _pissa_resource_evidence(
                 before,
                 after,
@@ -393,7 +388,7 @@ def prepare_pissa_gate(
             spec=DEFAULT_PISSA_PREPARATION_SPEC,
             local_files_only=True,
         )
-        after = assert_host_ready(allowed_pids=allowed)
+        after = assert_host_ready()
         resources = _pissa_resource_evidence(
             before,
             after,
@@ -404,7 +399,7 @@ def prepare_pissa_gate(
 
 
 def write_environment_gate(output_dir: str | Path) -> dict[str, Any]:
-    """Record a CPU/read-only host report; GPU idleness is rechecked at launch."""
+    """Record a CPU/read-only host report."""
 
     install_frozen_environment()
     status = host_status()
@@ -414,7 +409,7 @@ def write_environment_gate(output_dir: str | Path) -> dict[str, Any]:
         "status": "observed",
         "host": status.to_dict(),
         "native_stack": audit_native_stack(),
-        "note": "foreign compute processes are transient and are rechecked before every GPU phase",
+        "note": "GPU sharing is allowed; host and whole-device memory limits remain enforced",
     }
     write_json(output / "environment.json", report)
     return report

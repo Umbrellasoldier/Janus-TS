@@ -34,9 +34,7 @@ from .artifacts import sha256_bytes, sha256_file, sha256_json, write_json
 from .runtime import (
     ResourceUnavailableError,
     RuntimeContractError,
-    approved_external_gpu_pids,
     assert_host_ready,
-    descendant_pids,
     install_frozen_environment,
 )
 
@@ -582,17 +580,11 @@ def wait_for_host_resources(
             gate(
                 required_gpu_count=2,
                 minimum_mem_available_kib=16 * 1024 * 1024,
-                allowed_pids=tuple(
-                    sorted(
-                        set(descendant_pids())
-                        | set(approved_external_gpu_pids())
-                    )
-                ),
             )
             if last_reason is not None:
                 _emit(
                     spec,
-                    "READY_GPU: sharing policy is satisfied and MemAvailable >= 16 GiB",
+                    "READY_GPU: MemAvailable >= 16 GiB",
                 )
             return
         except ResourceUnavailableError as exc:

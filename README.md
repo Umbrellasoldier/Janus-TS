@@ -24,11 +24,9 @@ uv run janus-ts infer thinking --help
 `train smoke` performs the CPU/data/snapshot/native audits, the two-rank CUDA
 kernel and dtype gates, immutable PiSSA preparation, microbatch-1 and optional
 microbatch-2 memory smokes, and an interruption/resume continuity test. Each
-GPU phase takes the dedicated gu30 lock and normally refuses to compete with a
-foreign compute process. For this Transition1x workflow only, the eight
-LAMMPS process identities captured before launch form a fixed, non-expanding
-sharing allowlist; every new or unbound GPU process still blocks. The workflow
-never signals or kills those jobs. Candidate microbatch 2 is selected only
+GPU phase takes the dedicated gu30 lock so two Janus-TS launchers cannot
+compete with each other. Other users' GPU jobs may coexist and are never
+signalled or killed. Candidate microbatch 2 is selected only
 from a receipt whose whole-device peak is at most 45,056 MiB per GPU, including
 LAMMPS usage, and whose swap growth is at most 256 MiB. A content-verified
 candidate rejection falls back to the single frozen default rather than
@@ -65,8 +63,8 @@ uv run janus-ts infer thinking \
 ```
 
 The launcher uses the project's absolute `torchrun`, takes the same exclusive
-gu30 GPU lock, and repeats the foreign-process and host-readiness checks before
-and after the two-rank job. Without `--reaction-id` it inspects only the first
+gu30 GPU lock, and repeats the host-readiness checks before and after the
+two-rank job. Without `--reaction-id` it inspects only the first
 two records by default; `--limit` changes that finite selection. An odd number
 of selected records adds one deterministic dummy `generate` call so both
 ZeRO-3 ranks execute the same number of collectives, but the dummy is never
