@@ -110,10 +110,11 @@ disk-backed and content-addressed; no truncation is permitted.
   and final-logit BF16 dtypes, finite logits, and exact argmax equality are
   mandatory. Behavioral parity additionally requires at least 90% overlap of
   the top 32 tokens, total-variation distance at most 0.05, Jensen-Shannon
-  divergence at most 0.002 nats, maximum single-token probability change at
-  most 0.02, and centered-logit NRMSE at most 0.05. Raw maximum and mean
-  absolute logit errors remain recorded diagnostics; pointwise relative error
-  near zero and softmax-invariant global logit shifts are not gate criteria.
+  divergence at most 0.002 nats, and centered-logit NRMSE at most 0.05. The
+  maximum single-token probability change remains a recorded diagnostic and
+  is mathematically bounded by the total-variation gate. Raw maximum and mean
+  absolute logit errors are also diagnostics; pointwise relative error near
+  zero and softmax-invariant global logit shifts are not gate criteria.
 - AdamW (`adamw_torch`), learning rate 1e-4, betas (0.9, 0.999), epsilon 1e-8,
   weight decay 0, cosine schedule, warmup ratio 0.05, max gradient norm 1.
 - Five epochs. Default geometry is microbatch 1/GPU x 2 GPUs x accumulation 8

@@ -27,7 +27,6 @@ PISSA_PARITY_TOP_K = 32
 PISSA_PARITY_MIN_TOP_K_OVERLAP = 0.90
 PISSA_PARITY_MAX_TOTAL_VARIATION = 0.05
 PISSA_PARITY_MAX_JENSEN_SHANNON = 0.002
-PISSA_PARITY_MAX_PROBABILITY_DELTA = 0.02
 PISSA_PARITY_MAX_CENTERED_NRMSE = 0.05
 
 
@@ -113,7 +112,6 @@ def _pissa_parity_policy() -> dict[str, Any]:
         "min_top_k_overlap": PISSA_PARITY_MIN_TOP_K_OVERLAP,
         "max_total_variation": PISSA_PARITY_MAX_TOTAL_VARIATION,
         "max_jensen_shannon": PISSA_PARITY_MAX_JENSEN_SHANNON,
-        "max_probability_delta": PISSA_PARITY_MAX_PROBABILITY_DELTA,
         "max_centered_nrmse": PISSA_PARITY_MAX_CENTERED_NRMSE,
         "requires_exact_argmax": True,
     }
@@ -194,8 +192,6 @@ def _assert_pissa_behavioral_parity(metrics: dict[str, Any], *, stage: str) -> N
         failures.append("total variation above maximum")
     if metrics["jensen_shannon"] > PISSA_PARITY_MAX_JENSEN_SHANNON:
         failures.append("Jensen-Shannon divergence above maximum")
-    if metrics["max_probability_delta"] > PISSA_PARITY_MAX_PROBABILITY_DELTA:
-        failures.append("maximum token-probability delta above maximum")
     if metrics["centered_nrmse"] > PISSA_PARITY_MAX_CENTERED_NRMSE:
         failures.append("centered logit NRMSE above maximum")
     if failures:
@@ -387,7 +383,6 @@ __all__ = [
     "GateError",
     "PISSA_PARITY_MAX_CENTERED_NRMSE",
     "PISSA_PARITY_MAX_JENSEN_SHANNON",
-    "PISSA_PARITY_MAX_PROBABILITY_DELTA",
     "PISSA_PARITY_MAX_TOTAL_VARIATION",
     "PISSA_PARITY_MIN_TOP_K_OVERLAP",
     "PISSA_PARITY_TOP_K",

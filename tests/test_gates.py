@@ -93,6 +93,7 @@ def test_pissa_behavioral_parity_rejects_distribution_and_ranking_drift() -> Non
     changed = reference.flip(0)
     metrics = _pissa_behavioral_metrics(reference, changed)
 
+    assert metrics["max_probability_delta"] <= metrics["total_variation"] + 1e-7
     with pytest.raises(GateError, match="argmax changed.*top-k overlap"):
         _assert_pissa_behavioral_parity(metrics, stage="test")
 
