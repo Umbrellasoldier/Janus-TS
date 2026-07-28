@@ -297,7 +297,14 @@ def test_zero3_model_loader_never_requests_a_device_map_or_offload(tmp_path, mon
     monkeypatch.setattr(
         distributed, "validate_pissa_initialization_config", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(distributed, "assert_pissa_adapter_contract", lambda value: None)
+    monkeypatch.setattr(
+        distributed,
+        "assert_pissa_adapter_contract",
+        lambda value, *, adapter_dtype: (
+            value is model and adapter_dtype == torch.bfloat16
+        )
+        or pytest.fail("training loader must validate the BF16 adapter dtype"),
+    )
     monkeypatch.setattr(
         distributed, "assert_model_precision_and_freezing", lambda value, torch_module: None
     )

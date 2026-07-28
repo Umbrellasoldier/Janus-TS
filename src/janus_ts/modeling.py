@@ -960,11 +960,17 @@ def attach_pissa_adapter(model: Any) -> Any:
     return peft_model
 
 
-def assert_pissa_adapter_contract(model: Any, target_modules: Sequence[str] | None = None) -> None:
-    """Hard-check module coverage, freezing, FP32 dtype, and logical count."""
+def assert_pissa_adapter_contract(
+    model: Any,
+    target_modules: Sequence[str] | None = None,
+    *,
+    adapter_dtype: Any | None = None,
+) -> None:
+    """Hard-check module coverage, freezing, adapter dtype, and logical count."""
 
     import torch
 
+    expected_dtype = torch.float32 if adapter_dtype is None else adapter_dtype
     targets = tuple(target_modules or topology_summary(model.config).target_modules)
     modules = tuple(model.named_modules())
     missing_or_ambiguous: list[str] = []
@@ -994,7 +1000,7 @@ def assert_pissa_adapter_contract(model: Any, target_modules: Sequence[str] | No
             trainable_count += _logical_numel(parameter)
             if not is_adapter:
                 wrongly_trainable.append(name)
-            if parameter.dtype != torch.float32:
+            if parameter.dtype != expected_dtype:
                 wrong_dtype.append(name)
         elif is_adapter:
             frozen_adapters.append(name)
@@ -1009,7 +1015,8 @@ def assert_pissa_adapter_contract(model: Any, target_modules: Sequence[str] | No
             "PiSSA adapter contract failed: "
             f"trainable={trainable_count:,} (expected {EXPECTED_TRAINABLE_PARAMETERS:,}), "
             f"non_lora_trainable={wrongly_trainable[:8]!r}, "
-            f"frozen_lora={frozen_adapters[:8]!r}, non_fp32={wrong_dtype[:8]!r}"
+            f"frozen_lora={frozen_adapters[:8]!r}, "
+            f"wrong_dtype_expected_{expected_dtype}={wrong_dtype[:8]!r}"
         )
 
 

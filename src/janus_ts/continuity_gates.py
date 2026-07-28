@@ -1000,7 +1000,7 @@ def _load_zero3_resume_adapter_model(
     model.config.use_cache = False
     model.config.pad_token_id = QWEN_PAD_TOKEN_ID
     model.config.eos_token_id = QWEN_IM_END_TOKEN_ID
-    assert_pissa_adapter_contract(model)
+    assert_pissa_adapter_contract(model, adapter_dtype=torch.bfloat16)
     report = assert_zero3_bf16_precision(arguments, model)
     model._janus_ts_parity_precision_report = report
     model.eval()

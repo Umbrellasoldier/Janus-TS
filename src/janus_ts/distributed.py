@@ -613,7 +613,7 @@ def load_zero3_prepared_model(
     model._janus_ts_input_grads_enabled = True
     model._janus_ts_reentrant_gc_enabled = True
     model.train()
-    assert_pissa_adapter_contract(model)
+    assert_pissa_adapter_contract(model, adapter_dtype=torch_module.bfloat16)
     assert_model_precision_and_freezing(model, torch_module)
     precision = assert_zero3_bf16_precision(arguments, model)
     model._janus_ts_precision_report = precision
