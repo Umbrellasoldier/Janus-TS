@@ -193,18 +193,27 @@ All five sealed epoch checkpoints are evaluated on the 994-example validation
 set after training; Trainer does not run a second implicit validation pass
 inside the training epoch. This keeps each durable checkpoint at the true
 post-training boundary and makes its saved RNG state the state entering the
-next epoch. After locking the selected checkpoint, the 996-example test set is
-evaluated once. Optional thinking inference is a separately labeled
-exploratory profile and cannot affect formal selection.
+next epoch. After locking the selected checkpoint, the complete 996-example
+test split is run in this order:
 
-After Qwen checkpoint selection is locked, the original pinned
-`Qwen/Qwen3.6-27B` text model is loaded directly in BF16 without PiSSA or LoRA
-and evaluated zero-shot on the same complete 996-example test split. It uses
-the identical `MoleCode-TS/v1` system prompt and input, non-thinking mode,
-beam 10, 512-token limit, strict parser, and @1/@2/@3/@4/@5/@10 metrics. The
-zero-shot result cannot participate in checkpoint selection. The final report
-places the selected fine-tuned model and zero-shot Qwen side by side; no
-historical-comparison artifact or partial test intersection is produced.
+1. original Qwen zero-shot, non-thinking;
+2. original Qwen zero-shot, thinking;
+3. selected fine-tuned checkpoint, non-thinking;
+4. selected fine-tuned checkpoint, thinking.
+
+The original pinned `Qwen/Qwen3.6-27B` is loaded directly in BF16 without
+PiSSA or LoRA. Both non-thinking modes use the identical `MoleCode-TS/v1`
+prompt, beam 10, 512-token limit, strict parser, and
+@1/@2/@3/@4/@5/@10 metrics. Both thinking modes use the separately frozen
+single-sample profile (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
+`max_new_tokens=8192`). Their raw reasoning is retained; only the final answer
+after exactly one `</think>` marker is parsed and scored at @1. A missing,
+repeated, or unterminated thinking boundary is invalid.
+
+Thinking artifacts are supplemental (`formal_eligible=false`), do not acquire
+the formal test lease, and cannot affect checkpoint selection. The final
+report compares all four complete-test modes. No historical-comparison
+artifact or partial test intersection is produced.
 
 ## Persistence and host safety
 

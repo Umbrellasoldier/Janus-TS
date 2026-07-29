@@ -634,12 +634,15 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
     )
     by_path = {item.path.resolve(): item for item in checkpoints}
     phases: list[str] = []
+    mode_order: list[str] = []
 
     monkeypatch.setattr(workflow, "_run_portable_parity_gate", lambda *a, **k: {})
 
     def delegated(phase, command, **kwargs):
         del kwargs
         phases.append(phase)
+        if phase.startswith("formal-test-epoch-"):
+            mode_order.append("fine-tuned/non-thinking")
         return workflow.CommandOutcome(phase, tuple(command), 0)
 
     monkeypatch.setattr(workflow, "run_locked_gpu_command", delegated)
@@ -689,6 +692,7 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
 
     def zero_shot(_prepared, *, runner):
         del runner
+        mode_order.append("zero-shot/non-thinking")
         root = _prepared.paths.evaluations
         metrics = root / "zero-shot.metrics.json"
         predictions = root / "zero-shot.predictions.jsonl"
@@ -698,14 +702,30 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
 
     monkeypatch.setattr(workflow, "_run_zero_shot_baseline", zero_shot)
 
+    zero_thinking = SimpleNamespace(name="zero-thinking")
+    fine_thinking = SimpleNamespace(name="fine-thinking")
+
+    def thinking(_prepared, *, role, checkpoint, runner):
+        del _prepared, runner
+        mode_order.append(f"{role}/thinking")
+        if role == "zero-shot":
+            assert checkpoint is None
+            return zero_thinking
+        assert checkpoint == checkpoints[2]
+        return fine_thinking
+
+    monkeypatch.setattr(workflow, "_run_thinking_test", thinking)
+
     def comparison(_prepared, selected, **kwargs):
         assert selected == checkpoints[2]
         assert kwargs["baseline"] is baseline
-        path = _prepared.paths.evaluations / "zero-shot-comparison.json"
+        assert kwargs["zero_shot_thinking"] is zero_thinking
+        assert kwargs["fine_tuned_thinking"] is fine_thinking
+        path = _prepared.paths.evaluations / "inference-mode-comparison.json"
         path.write_text("{}\n", encoding="utf-8")
         return path
 
-    monkeypatch.setattr(workflow, "_write_zero_shot_comparison", comparison)
+    monkeypatch.setattr(workflow, "_write_inference_mode_comparison", comparison)
 
     first = workflow.run_evaluation_phase(prepared, checkpoints)
     second = workflow.run_evaluation_phase(prepared, checkpoints)
@@ -718,11 +738,19 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
         "formal-val-epoch-5",
         "formal-test-epoch-3",
     ]
+    assert mode_order[:4] == [
+        "zero-shot/non-thinking",
+        "zero-shot/thinking",
+        "fine-tuned/non-thinking",
+        "fine-tuned/thinking",
+    ]
     state = json.loads((prepared.paths.project / "state.json").read_text(encoding="utf-8"))
     assert state["stage"] == "complete"
     assert state["selected_epoch"] == 3
     assert state["test_evaluated"] is True
     assert state["zero_shot_baseline_evaluated"] is True
+    assert state["zero_shot_thinking_evaluated"] is True
+    assert state["fine_tuned_thinking_evaluated"] is True
 
 
 def test_checkpoint_callback_factory_is_late_bound(tmp_path):

@@ -1701,6 +1701,33 @@ def _zero_shot_eval_command(prepared: PreparedRun) -> tuple[str, ...]:
     )
 
 
+def _thinking_eval_command(
+    prepared: PreparedRun,
+    *,
+    role: Literal["zero-shot", "fine-tuned"],
+    checkpoint: EpochCheckpoint | None = None,
+) -> tuple[str, ...]:
+    arguments = [
+        role,
+        "--config",
+        str(prepared.config_path),
+        "--processed-path",
+        str(prepared.processed_path),
+        "--output-dir",
+        str(prepared.paths.evaluations.resolve()),
+        "--run-fingerprint",
+        prepared.run_identity.fingerprint,
+    ]
+    if role == "zero-shot":
+        if checkpoint is not None:
+            raise WorkflowError("zero-shot thinking must not receive a checkpoint")
+    else:
+        if checkpoint is None:
+            raise WorkflowError("fine-tuned thinking requires the selected checkpoint")
+        arguments.extend(("--checkpoint-dir", str(checkpoint.path.resolve())))
+    return torchrun_command("janus_ts.thinking_evaluation", *arguments)
+
+
 def _validate_generation_smoke(value: Any, config: ExperimentConfig) -> None:
     """Validate formal parsing plus the forced-full-512 stress receipt."""
 
@@ -2089,6 +2116,79 @@ def _run_zero_shot_baseline(
     return baseline, metrics, predictions
 
 
+def _run_thinking_test(
+    prepared: PreparedRun,
+    *,
+    role: Literal["zero-shot", "fine-tuned"],
+    checkpoint: EpochCheckpoint | None,
+    runner: Runner,
+) -> Any:
+    from .thinking_evaluation import (
+        build_thinking_binding,
+        validate_thinking_completion,
+    )
+
+    binding, _ = build_thinking_binding(
+        prepared.config,
+        prepared.processed_path,
+        run_fingerprint=prepared.run_identity.fingerprint,
+        role=role,
+        checkpoint_dir=checkpoint.path if checkpoint is not None else None,
+    )
+    stage_name = f"supplemental-thinking-{role}-test"
+    stage = (
+        prepared.paths.project / "workflow" / f"thinking-{role}-{binding.checkpoint_fingerprint}"
+    )
+    stored = load_stage(
+        stage,
+        stage=stage_name,
+        fingerprint=binding.checkpoint_fingerprint,
+    )
+    if stored is not None:
+        receipt = validate_thinking_completion(prepared.paths.evaluations, binding)
+        if receipt is None:
+            raise WorkflowError(f"sealed {role} thinking stage lacks its runtime receipt")
+        return receipt
+
+    receipt = validate_thinking_completion(prepared.paths.evaluations, binding)
+    if receipt is None:
+        outcome = run_locked_gpu_command(
+            f"thinking-test-{role}",
+            _thinking_eval_command(
+                prepared,
+                role=role,
+                checkpoint=checkpoint,
+            ),
+            lock_path=prepared.config.runtime.gpu_lock_path,
+            required_gpu_count=prepared.config.runtime.required_gpu_count,
+            runner=runner,
+        )
+        _require_success(outcome)
+        receipt = validate_thinking_completion(prepared.paths.evaluations, binding)
+    if receipt is None:
+        raise WorkflowError(f"{role} thinking evaluation has no complete receipt")
+    report = {
+        "status": "pass",
+        "split": "test",
+        "role": role,
+        "checkpoint_fingerprint": binding.checkpoint_fingerprint,
+        "runtime_receipt": str(receipt.path),
+        "runtime_receipt_sha256": sha256_file(receipt.path),
+        "metrics": str(receipt.metrics_path),
+        "metrics_sha256": sha256_file(receipt.metrics_path),
+        "scored_predictions": str(receipt.predictions_path),
+        "scored_predictions_sha256": sha256_file(receipt.predictions_path),
+        "raw_artifact": str(receipt.payload["raw_artifact_path"]),
+    }
+    seal_stage(
+        stage,
+        stage=stage_name,
+        fingerprint=binding.checkpoint_fingerprint,
+        report=report,
+    )
+    return receipt
+
+
 def _validated_test_report(path: Path) -> Mapping[str, Any]:
     from .constants import FORMAL_EVAL_K
     from .generation import EXPECTED_FORMAL_SPLIT_COUNTS
@@ -2111,7 +2211,35 @@ def _validated_test_report(path: Path) -> Mapping[str, Any]:
     return evaluation
 
 
-def _write_zero_shot_comparison(
+def _validated_thinking_report(path: Path) -> Mapping[str, Any]:
+    from .generation import EXPECTED_FORMAL_SPLIT_COUNTS
+    from .thinking_evaluation import THINKING_EVALUATION_SCHEMA_VERSION
+
+    payload = _read_json(path)
+    if (
+        payload.get("schema_version") != THINKING_EVALUATION_SCHEMA_VERSION
+        or payload.get("formal_eligible") is not False
+        or payload.get("affects_checkpoint_selection") is not False
+        or payload.get("split") != "test"
+        or payload.get("report_k") != [1]
+    ):
+        raise WorkflowError(f"thinking metrics has the wrong protocol: {path}")
+    evaluation = payload.get("evaluation")
+    metrics = evaluation.get("metrics") if isinstance(evaluation, Mapping) else None
+    at_one = metrics.get("@1") if isinstance(metrics, Mapping) else None
+    expected_count = EXPECTED_FORMAL_SPLIT_COUNTS["test"]
+    if (
+        not isinstance(evaluation, Mapping)
+        or not isinstance(metrics, Mapping)
+        or set(metrics) != {"@1"}
+        or not isinstance(at_one, Mapping)
+        or at_one.get("count") != expected_count
+    ):
+        raise WorkflowError(f"thinking @1 count is not {expected_count}: {path}")
+    return evaluation
+
+
+def _write_inference_mode_comparison(
     prepared: PreparedRun,
     selected: EpochCheckpoint,
     *,
@@ -2120,31 +2248,57 @@ def _write_zero_shot_comparison(
     baseline: Any,
     baseline_metrics: Path,
     baseline_predictions: Path,
+    zero_shot_thinking: Any,
+    fine_tuned_thinking: Any,
 ) -> Path:
-    output = prepared.paths.evaluations / "zero-shot-comparison.json"
+    output = prepared.paths.evaluations / "inference-mode-comparison.json"
     payload = {
-        "schema_version": "janus-ts-zero-shot-comparison-v1",
+        "schema_version": "janus-ts-four-mode-comparison-v1",
         "data_fingerprint": prepared.run_identity.data_fingerprint,
         "run_fingerprint": prepared.run_identity.fingerprint,
         "test_count": 996,
+        "execution_order": [
+            "zero-shot/non-thinking",
+            "zero-shot/thinking",
+            "fine-tuned/non-thinking",
+            "fine-tuned/thinking",
+        ],
         "fine_tuned_qwen": {
             "selected_epoch": selected.epoch,
             "checkpoint_fingerprint": selected.checkpoint_fingerprint,
-            "metrics_sha256": sha256_file(selected_metrics),
-            "predictions_sha256": sha256_file(selected_predictions),
-            "evaluation": _validated_test_report(selected_metrics),
+            "non_thinking": {
+                "metrics_sha256": sha256_file(selected_metrics),
+                "predictions_sha256": sha256_file(selected_predictions),
+                "evaluation": _validated_test_report(selected_metrics),
+            },
+            "thinking": {
+                "sample_count_per_reaction": 1,
+                "metrics_sha256": sha256_file(fine_tuned_thinking.metrics_path),
+                "scored_predictions_sha256": sha256_file(fine_tuned_thinking.predictions_path),
+                "raw_artifact": str(fine_tuned_thinking.payload["raw_artifact_path"]),
+                "evaluation": _validated_thinking_report(fine_tuned_thinking.metrics_path),
+            },
         },
         "qwen_zero_shot": {
             "model_fingerprint": baseline.model_fingerprint,
             "protocol": dict(baseline.protocol),
-            "metrics_sha256": sha256_file(baseline_metrics),
-            "predictions_sha256": sha256_file(baseline_predictions),
-            "evaluation": _validated_test_report(baseline_metrics),
+            "non_thinking": {
+                "metrics_sha256": sha256_file(baseline_metrics),
+                "predictions_sha256": sha256_file(baseline_predictions),
+                "evaluation": _validated_test_report(baseline_metrics),
+            },
+            "thinking": {
+                "sample_count_per_reaction": 1,
+                "metrics_sha256": sha256_file(zero_shot_thinking.metrics_path),
+                "scored_predictions_sha256": sha256_file(zero_shot_thinking.predictions_path),
+                "raw_artifact": str(zero_shot_thinking.payload["raw_artifact_path"]),
+                "evaluation": _validated_thinking_report(zero_shot_thinking.metrics_path),
+            },
         },
     }
     if output.exists():
         if _read_json(output) != payload:
-            raise WorkflowError("zero-shot comparison artifact drift")
+            raise WorkflowError("four-mode comparison artifact drift")
     else:
         write_json(output, payload)
     return output
@@ -2156,7 +2310,7 @@ def run_evaluation_phase(
     *,
     runner: Runner = subprocess.run,
 ) -> EpochCheckpoint:
-    """Validate five epochs, test the winner, then compare raw-Qwen zero-shot."""
+    """Select on validation, then run the four requested test inference modes."""
 
     from .evaluation import select_best_checkpoint
     from .formal_eval_runtime import load_checkpoint_score
@@ -2204,6 +2358,16 @@ def run_evaluation_phase(
         stage="testing",
         global_step=epochs[-1].global_step,
     )
+    baseline, baseline_metrics, baseline_predictions = _run_zero_shot_baseline(
+        prepared,
+        runner=runner,
+    )
+    zero_shot_thinking = _run_thinking_test(
+        prepared,
+        role="zero-shot",
+        checkpoint=None,
+        runner=runner,
+    )
     selected_metrics, selected_predictions = _run_one_formal_evaluation(
         prepared,
         selected,
@@ -2211,11 +2375,13 @@ def run_evaluation_phase(
         selection_proof=proof,
         runner=runner,
     )
-    baseline, baseline_metrics, baseline_predictions = _run_zero_shot_baseline(
+    fine_tuned_thinking = _run_thinking_test(
         prepared,
+        role="fine-tuned",
+        checkpoint=selected,
         runner=runner,
     )
-    comparison = _write_zero_shot_comparison(
+    comparison = _write_inference_mode_comparison(
         prepared,
         selected,
         selected_metrics=selected_metrics,
@@ -2223,6 +2389,8 @@ def run_evaluation_phase(
         baseline=baseline,
         baseline_metrics=baseline_metrics,
         baseline_predictions=baseline_predictions,
+        zero_shot_thinking=zero_shot_thinking,
+        fine_tuned_thinking=fine_tuned_thinking,
     )
     _advance_run_state(
         prepared,
@@ -2232,7 +2400,9 @@ def run_evaluation_phase(
         selected_checkpoint_fingerprint=selected.checkpoint_fingerprint,
         test_evaluated=True,
         zero_shot_baseline_evaluated=True,
-        zero_shot_comparison=str(comparison),
+        zero_shot_thinking_evaluated=True,
+        fine_tuned_thinking_evaluated=True,
+        inference_mode_comparison=str(comparison),
     )
     return selected
 

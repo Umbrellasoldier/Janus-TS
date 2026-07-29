@@ -137,7 +137,7 @@ def train_smoke(
 def train_run(
     config_path: ConfigOption = Path("configs/transition1x.yaml"),
 ) -> None:
-    """Resume or finish five epochs, select on validation, and test exactly once."""
+    """Resume five epochs, select on validation, then run four test inference modes."""
 
     from .workflow import run_full_workflow
 
@@ -193,7 +193,7 @@ def train_worker(
 def evaluate_run(
     config_path: ConfigOption = Path("configs/transition1x.yaml"),
 ) -> None:
-    """Resume formal validation/selection/test for an already trained run."""
+    """Resume validation, selection, and the four ordered test inference modes."""
 
     from .workflow import prepare_smoke_workflow, run_evaluation_phase
 

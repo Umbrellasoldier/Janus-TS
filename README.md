@@ -34,20 +34,22 @@ five-epoch training directly.
 It then checks each epoch's rank-64 portable adapter against its rank-32 resume
 form before formal validation. Epoch 1 also gates the real longest-prompt
 beam-10 formal generation path and a separate forced-full-512-token memory
-stress decode. The workflow then locks the @10 lexicographic winner, evaluates
-the test split once, evaluates the frozen original Qwen model zero-shot on the
-same complete test split, and writes their full 996-reaction comparison. The
-zero-shot baseline uses no adapter, training update, or demonstration; its
-MoleCode-TS prompt and deterministic beam-10 generation are identical to the
-fine-tuned model.
+stress decode. After the @10 lexicographic winner is locked, the complete
+996-reaction test split runs in this order: raw-Qwen non-thinking, raw-Qwen
+thinking, selected-checkpoint non-thinking, selected-checkpoint thinking.
+Non-thinking uses deterministic beam 10 and reports @1/@2/@3/@4/@5/@10.
+Thinking uses the frozen single-sample profile, retains the raw reasoning,
+scores the answer after `</think>` at @1, and remains ineligible for checkpoint
+selection. The final artifact compares all four modes.
 Checkpoint and stage ordering use fingerprints, explicit global steps, and
 completion markers only—never filesystem modification time. Trainer events
 are appended and fsynced to the run's `logs/train.jsonl` every configured ten
 steps in addition to TensorBoard output.
 
-## Optional thinking-mode exploration
+## Optional subset thinking exploration
 
-Thinking-mode inference is an explicitly non-formal inspection tool. Supply
+In addition to the automatic complete-test evaluations, the `infer thinking`
+command is an explicitly non-formal subset inspection tool. Supply
 the processed dataset and the selected durable epoch checkpoint directly; the
 selection proof contains content fingerprints but does not contain enough path
 information to resolve either directory safely.
