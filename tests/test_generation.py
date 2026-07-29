@@ -282,6 +282,7 @@ def test_selection_proof_and_test_lease_allow_only_one_completed_run(
         run_fingerprint=test_identity.run_fingerprint,
         selected_checkpoint_fingerprint=test_identity.checkpoint_fingerprint,
         selected_epoch=3,
+        selected_global_step=300,
     )
     proof_path = write_selection_proof(tmp_path / "selection.json", proof)
     assert load_selection_proof(proof_path, test_identity) == proof

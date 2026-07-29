@@ -577,6 +577,59 @@ def test_epoch_enumeration_uses_manifest_epoch_and_step_not_mtime(tmp_path):
     assert [item.global_step for item in values] == [100, 200, 300, 400, 500]
 
 
+def test_checkpoint_candidates_are_only_exact_train_loss_minimum_and_final(tmp_path):
+    prepared = _prepared(tmp_path)
+    prepared.paths.durable_checkpoints.mkdir(parents=True)
+    for epoch in range(1, 6):
+        checkpoint = prepared.paths.durable_checkpoints / f"epoch-{epoch}"
+        (checkpoint / "portable_adapter").mkdir(parents=True)
+        (checkpoint / "portable_adapter" / "adapter_model.safetensors").write_bytes(b"x")
+        mark_complete(
+            checkpoint,
+            {
+                "kind": "epoch",
+                **prepared.checkpoint_identity.as_dict(),
+                "epoch": float(epoch),
+                "global_step": epoch * 100,
+                "pissa_initial_adapter_fingerprint": "a" * 64,
+            },
+        )
+    epochs = workflow.enumerate_epoch_checkpoints(prepared)
+    log_path = prepared.paths.project / "logs" / "train.jsonl"
+    log_path.parent.mkdir(parents=True)
+    rows = [
+        {
+            "run_fingerprint": prepared.run_identity.fingerprint,
+            "global_step": 300,
+            "epoch": 3.0,
+            "logs": {"loss": 0.05},
+        },
+        {
+            "run_fingerprint": prepared.run_identity.fingerprint,
+            "global_step": 500,
+            "epoch": 5.0,
+            "logs": {"loss": 0.1},
+        },
+    ]
+    log_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    candidates = workflow.resolve_checkpoint_candidates(prepared, epochs)
+
+    assert [item.global_step for item in candidates] == [300, 500]
+    assert [item.kind for item in candidates] == ["train-loss", "final"]
+    assert [item.train_loss for item in candidates] == [0.05, 0.1]
+    report = json.loads(
+        (prepared.paths.project / "workflow" / "checkpoint-candidates.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(report["candidates"]) == 2
+    assert report["selection_scope"] == "validation-only"
+
+
 def test_complete_epoch_set_repairs_training_handoff_without_gpu(tmp_path, monkeypatch):
     prepared = _prepared(tmp_path)
     initialize_run(prepared.paths, prepared.run_identity)
@@ -632,6 +685,29 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
         )
         for epoch in range(1, 6)
     )
+    candidates = (
+        workflow.EpochCheckpoint(
+            epoch=checkpoints[2].epoch,
+            global_step=checkpoints[2].global_step,
+            path=checkpoints[2].path,
+            checkpoint_fingerprint=checkpoints[2].checkpoint_fingerprint,
+            kind="train-loss",
+            train_loss=0.1,
+        ),
+        workflow.EpochCheckpoint(
+            epoch=checkpoints[-1].epoch,
+            global_step=checkpoints[-1].global_step,
+            path=checkpoints[-1].path,
+            checkpoint_fingerprint=checkpoints[-1].checkpoint_fingerprint,
+            kind="final",
+            train_loss=0.2,
+        ),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "resolve_checkpoint_candidates",
+        lambda _prepared, _checkpoints: candidates,
+    )
     by_path = {item.path.resolve(): item for item in checkpoints}
     phases: list[str] = []
     mode_order: list[str] = []
@@ -641,7 +717,7 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
     def delegated(phase, command, **kwargs):
         del kwargs
         phases.append(phase)
-        if phase.startswith("formal-test-epoch-"):
+        if phase.startswith("formal-test-step-"):
             mode_order.append("fine-tuned/non-thinking")
         return workflow.CommandOutcome(phase, tuple(command), 0)
 
@@ -685,7 +761,7 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
     monkeypatch.setattr(
         evaluation_module,
         "select_best_checkpoint",
-        lambda values: tuple(values)[2],
+        lambda values: tuple(values)[0],
     )
 
     baseline = SimpleNamespace(model_fingerprint="b" * 64, protocol={"training_updates": 0})
@@ -711,13 +787,13 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
         if role == "zero-shot":
             assert checkpoint is None
             return zero_thinking
-        assert checkpoint == checkpoints[2]
+        assert checkpoint == candidates[0]
         return fine_thinking
 
     monkeypatch.setattr(workflow, "_run_thinking_test", thinking)
 
     def comparison(_prepared, selected, **kwargs):
-        assert selected == checkpoints[2]
+        assert selected == candidates[0]
         assert kwargs["baseline"] is baseline
         assert kwargs["zero_shot_thinking"] is zero_thinking
         assert kwargs["fine_tuned_thinking"] is fine_thinking
@@ -729,14 +805,11 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
 
     first = workflow.run_evaluation_phase(prepared, checkpoints)
     second = workflow.run_evaluation_phase(prepared, checkpoints)
-    assert first == second == checkpoints[2]
+    assert first == second == candidates[0]
     assert phases == [
-        "formal-val-epoch-1",
-        "formal-val-epoch-2",
-        "formal-val-epoch-3",
-        "formal-val-epoch-4",
-        "formal-val-epoch-5",
-        "formal-test-epoch-3",
+        "formal-val-step-000000300",
+        "formal-val-step-000000500",
+        "formal-test-step-000000300",
     ]
     assert mode_order[:4] == [
         "zero-shot/non-thinking",
@@ -814,6 +887,59 @@ def test_rank_zero_jsonl_recovers_only_an_unterminated_final_record(tmp_path, mo
     )
     assert callback.launch_ordinal == 2
     assert path.read_bytes() == retained
+
+
+def test_rank_zero_log_preserves_only_best_exact_step_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("RANK", "0")
+    identity = _checkpoint_identity()
+    local_root = tmp_path / "checkpoints"
+    candidate_root = tmp_path / "loss-candidates"
+    for step, epoch in ((50, 0.5), (100, 1.0)):
+        checkpoint = local_root / f"resume-step-{step:09d}"
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "payload.bin").write_bytes(f"step-{step}".encode())
+        mark_complete(
+            checkpoint,
+            {
+                "kind": "rolling",
+                **identity.as_dict(),
+                "global_step": step,
+                "epoch": epoch,
+            },
+        )
+    callback = workflow.RankZeroJsonlLogCallback(
+        tmp_path / "logs" / "train.jsonl",
+        run_fingerprint=identity.run_fingerprint,
+        resume_checkpoint=None,
+        log_steps=10,
+        checkpoint_identity=identity,
+        local_checkpoint_root=local_root,
+        loss_candidate_root=candidate_root,
+        checkpoint_steps=50,
+    )
+    callback.on_log(
+        None,
+        SimpleNamespace(global_step=50, epoch=0.5, is_world_process_zero=True),
+        object(),
+        logs={"loss": 0.2},
+    )
+    first = candidate_root / "resume-step-000000050"
+    assert first.is_dir()
+    assert (first / "payload.bin").stat().st_ino == (
+        local_root / first.name / "payload.bin"
+    ).stat().st_ino
+
+    callback.on_log(
+        None,
+        SimpleNamespace(global_step=100, epoch=1.0, is_world_process_zero=True),
+        object(),
+        logs={"loss": 0.1},
+    )
+    assert not first.exists()
+    assert (candidate_root / "resume-step-000000100").is_dir()
+    index = json.loads((candidate_root / "best-train-loss.json").read_text(encoding="utf-8"))
+    assert index["global_step"] == 100
+    assert index["train_loss"] == 0.1
 
 
 def test_rank_zero_jsonl_rejects_a_malformed_completed_record(tmp_path, monkeypatch):

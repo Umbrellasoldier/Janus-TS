@@ -173,13 +173,13 @@ class EvaluationReport:
 @dataclass(frozen=True)
 class CheckpointScore:
     checkpoint_id: str
-    epoch: int
+    epoch: float
     metrics_at_10: AggregateMetrics
     eval_loss: float
 
     def __post_init__(self) -> None:
-        if self.epoch < 0:
-            raise ValueError("epoch must be non-negative")
+        if not math.isfinite(self.epoch) or self.epoch < 0:
+            raise ValueError("epoch must be finite and non-negative")
         if not math.isfinite(self.eval_loss):
             raise ValueError("eval_loss must be finite")
 

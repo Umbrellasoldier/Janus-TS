@@ -13,6 +13,7 @@ import errno
 import json
 import math
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -39,6 +40,7 @@ from .checkpointing import (
     CheckpointManager,
     JanusCheckpointCallback,
     ResumeCheckpoint,
+    materialize_train_loss_checkpoint,
     select_resume_checkpoint,
 )
 from .config import ExperimentConfig, load_config
@@ -139,10 +141,31 @@ class CommandOutcome:
 
 @dataclass(frozen=True, slots=True)
 class EpochCheckpoint:
-    epoch: int
+    epoch: float
     global_step: int
     path: Path
     checkpoint_fingerprint: str
+    kind: Literal["epoch", "train-loss", "final"] = "epoch"
+    train_loss: float | None = None
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(float(self.epoch)) or self.epoch <= 0:
+            raise WorkflowError("checkpoint epoch must be positive and finite")
+        if (
+            isinstance(self.global_step, bool)
+            or not isinstance(self.global_step, int)
+            or self.global_step <= 0
+        ):
+            raise WorkflowError("checkpoint global_step must be positive")
+        if self.kind not in {"epoch", "train-loss", "final"}:
+            raise WorkflowError(f"unsupported evaluation checkpoint kind {self.kind!r}")
+        if self.train_loss is not None and (
+            isinstance(self.train_loss, bool)
+            or not isinstance(self.train_loss, (int, float))
+            or not math.isfinite(float(self.train_loss))
+            or float(self.train_loss) < 0.0
+        ):
+            raise WorkflowError("checkpoint train_loss must be finite and non-negative")
 
 
 Runner = Callable[..., subprocess.CompletedProcess[Any]]
@@ -1283,6 +1306,92 @@ def make_checkpoint_callback_factory(
     return factory
 
 
+def _preserve_best_train_loss_checkpoint(
+    source: Path,
+    candidate_root: Path,
+    *,
+    identity: CheckpointIdentity,
+    train_loss: float,
+    global_step: int,
+) -> None:
+    """Hard-link one best-so-far rolling checkpoint before local rotation."""
+
+    if not math.isfinite(train_loss) or train_loss < 0.0:
+        raise WorkflowError(f"invalid checkpoint train loss {train_loss!r}")
+    try:
+        manifest = read_complete_manifest(source)
+    except (ArtifactError, OSError) as exc:
+        raise WorkflowError(
+            f"cannot preserve incomplete rolling checkpoint {source}: {exc}"
+        ) from exc
+    if (
+        manifest.get("kind") != "rolling"
+        or manifest.get("global_step") != global_step
+        or any(manifest.get(key) != value for key, value in identity.as_dict().items())
+    ):
+        raise WorkflowError(f"rolling checkpoint identity/step differs: {source}")
+
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    index_path = candidate_root / "best-train-loss.json"
+    previous: Mapping[str, Any] | None = None
+    if index_path.exists():
+        previous = _read_json(index_path)
+        if (
+            previous.get("schema_version")
+            != "janus-ts-best-train-loss-checkpoint-v1"
+            or previous.get("run_fingerprint") != identity.run_fingerprint
+            or isinstance(previous.get("train_loss"), bool)
+            or not isinstance(previous.get("train_loss"), (int, float))
+            or isinstance(previous.get("global_step"), bool)
+            or not isinstance(previous.get("global_step"), int)
+            or not isinstance(previous.get("checkpoint_name"), str)
+        ):
+            raise WorkflowError(f"invalid best-train-loss index: {index_path}")
+        previous_key = (float(previous["train_loss"]), int(previous["global_step"]))
+        if (train_loss, global_step) >= previous_key:
+            return
+
+    destination = candidate_root / source.name
+    if destination.exists():
+        try:
+            copied_manifest = read_complete_manifest(destination)
+        except (ArtifactError, OSError) as exc:
+            raise WorkflowError(f"existing loss candidate is incomplete: {destination}") from exc
+        if copied_manifest != manifest:
+            raise WorkflowError(f"existing loss candidate differs from source: {destination}")
+    else:
+        with atomic_directory(destination) as staging:
+            shutil.copytree(
+                source,
+                staging,
+                copy_function=os.link,
+                dirs_exist_ok=True,
+            )
+            if read_complete_manifest(staging) != manifest:
+                raise WorkflowError("hard-linked loss candidate differs from source")
+
+    write_json(
+        index_path,
+        {
+            "schema_version": "janus-ts-best-train-loss-checkpoint-v1",
+            "run_fingerprint": identity.run_fingerprint,
+            "checkpoint_name": destination.name,
+            "checkpoint_fingerprint": sha256_file(destination / "manifest.json"),
+            "global_step": global_step,
+            "epoch": float(manifest["epoch"]),
+            "train_loss": train_loss,
+        },
+    )
+    if previous is not None:
+        previous_name = str(previous["checkpoint_name"])
+        expected_name = CheckpointManager.checkpoint_name(int(previous["global_step"]))
+        if previous_name != expected_name:
+            raise WorkflowError("best-train-loss index has an unsafe checkpoint name")
+        previous_path = candidate_root / previous_name
+        if previous_path != destination and previous_path.is_dir():
+            shutil.rmtree(previous_path)
+
+
 class RankZeroJsonlLogCallback(TrainerCallback):
     """Fsync one JSON object per Trainer log event on global rank zero.
 
@@ -1299,6 +1408,10 @@ class RankZeroJsonlLogCallback(TrainerCallback):
         run_fingerprint: str,
         resume_checkpoint: str | Path | None,
         log_steps: int,
+        checkpoint_identity: CheckpointIdentity | None = None,
+        local_checkpoint_root: str | Path | None = None,
+        loss_candidate_root: str | Path | None = None,
+        checkpoint_steps: int | None = None,
     ) -> None:
         if log_steps != 10:
             raise WorkflowError(f"JSONL logging cadence must be 10, got {log_steps}")
@@ -1309,6 +1422,24 @@ class RankZeroJsonlLogCallback(TrainerCallback):
         )
         self._rank = int(os.environ.get("RANK", "0"))
         self.launch_ordinal = self._next_launch_ordinal() if self._rank == 0 else -1
+        preservation_values = (
+            checkpoint_identity,
+            local_checkpoint_root,
+            loss_candidate_root,
+            checkpoint_steps,
+        )
+        if any(value is not None for value in preservation_values) and not all(
+            value is not None for value in preservation_values
+        ):
+            raise WorkflowError("train-loss checkpoint preservation arguments must be complete")
+        self.checkpoint_identity = checkpoint_identity
+        self.local_checkpoint_root = (
+            Path(local_checkpoint_root) if local_checkpoint_root is not None else None
+        )
+        self.loss_candidate_root = (
+            Path(loss_candidate_root) if loss_candidate_root is not None else None
+        )
+        self.checkpoint_steps = checkpoint_steps
 
     def _next_launch_ordinal(self) -> int:
         if not self.path.exists():
@@ -1384,6 +1515,25 @@ class RankZeroJsonlLogCallback(TrainerCallback):
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        step = int(state.global_step)
+        raw_loss = payload["logs"].get("loss")
+        if (
+            self.checkpoint_identity is not None
+            and self.local_checkpoint_root is not None
+            and self.loss_candidate_root is not None
+            and self.checkpoint_steps is not None
+            and step > 0
+            and step % self.checkpoint_steps == 0
+            and not isinstance(raw_loss, bool)
+            and isinstance(raw_loss, (int, float))
+        ):
+            _preserve_best_train_loss_checkpoint(
+                self.local_checkpoint_root / CheckpointManager.checkpoint_name(step),
+                self.loss_candidate_root,
+                identity=self.checkpoint_identity,
+                train_loss=float(raw_loss),
+                global_step=step,
+            )
         return control
 
 
@@ -1393,6 +1543,10 @@ def make_jsonl_logging_callback_factory(
     run_fingerprint: str,
     resume_checkpoint: str | Path | None,
     log_steps: int,
+    checkpoint_identity: CheckpointIdentity | None = None,
+    local_checkpoint_root: str | Path | None = None,
+    loss_candidate_root: str | Path | None = None,
+    checkpoint_steps: int | None = None,
 ) -> Callable[[Callable[[], Any]], RankZeroJsonlLogCallback]:
     """Return a late-bound factory with the same surface as training hooks."""
 
@@ -1403,6 +1557,10 @@ def make_jsonl_logging_callback_factory(
             run_fingerprint=run_fingerprint,
             resume_checkpoint=resume_checkpoint,
             log_steps=log_steps,
+            checkpoint_identity=checkpoint_identity,
+            local_checkpoint_root=local_checkpoint_root,
+            loss_candidate_root=loss_candidate_root,
+            checkpoint_steps=checkpoint_steps,
         )
 
     return factory
@@ -1483,6 +1641,10 @@ def run_distributed_training_worker(
         run_fingerprint=identity.run_fingerprint,
         resume_checkpoint=resume_from_checkpoint,
         log_steps=config.train.log_steps,
+        checkpoint_identity=identity,
+        local_checkpoint_root=paths.local_checkpoints,
+        loss_candidate_root=paths.loss_candidates,
+        checkpoint_steps=config.train.checkpoint_steps,
     )
     run = build_full_distributed_run(
         config,
@@ -1584,6 +1746,236 @@ def enumerate_epoch_checkpoints(prepared: PreparedRun) -> tuple[EpochCheckpoint,
     ):
         raise WorkflowError("durable epoch global_step values are not strictly increasing")
     return ordered
+
+
+def _load_exact_train_losses(prepared: PreparedRun) -> dict[int, tuple[float, float]]:
+    """Return the latest exact-step train loss and epoch from the fsynced JSONL."""
+
+    path = prepared.paths.project / "logs" / "train.jsonl"
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise WorkflowError(f"cannot read training loss log {path}: {exc}") from exc
+    if not payload or not payload.endswith(b"\n"):
+        raise WorkflowError("completed training loss log is empty or unterminated")
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise WorkflowError(f"training loss log is not UTF-8: {exc}") from exc
+
+    losses: dict[int, tuple[float, float]] = {}
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError(
+                f"training loss log line {line_number} is malformed: {exc}"
+            ) from exc
+        if not isinstance(record, Mapping):
+            raise WorkflowError(f"training loss log line {line_number} is not an object")
+        if record.get("run_fingerprint") != prepared.run_identity.fingerprint:
+            raise WorkflowError("training loss log contains a foreign run fingerprint")
+        step = record.get("global_step")
+        epoch = record.get("epoch")
+        logs = record.get("logs")
+        if (
+            isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+            or not isinstance(logs, Mapping)
+        ):
+            raise WorkflowError(f"training loss log line {line_number} has invalid fields")
+        raw_loss = logs.get("loss")
+        if raw_loss is None:
+            continue
+        if (
+            isinstance(raw_loss, bool)
+            or not isinstance(raw_loss, (int, float))
+            or not math.isfinite(float(raw_loss))
+            or float(raw_loss) < 0.0
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, (int, float))
+            or not math.isfinite(float(epoch))
+            or float(epoch) <= 0.0
+        ):
+            raise WorkflowError(f"training loss log line {line_number} has invalid loss/epoch")
+        losses[step] = (float(raw_loss), float(epoch))
+    if not losses:
+        raise WorkflowError("training loss log contains no finite train losses")
+    return losses
+
+
+def _saved_checkpoint_sources(
+    prepared: PreparedRun,
+    epochs: Sequence[EpochCheckpoint],
+) -> dict[int, tuple[Path, Mapping[str, Any], str]]:
+    """Index retained rolling and durable checkpoints by explicit global step."""
+
+    sources: dict[int, tuple[Path, Mapping[str, Any], str]] = {}
+    roots = (
+        prepared.paths.loss_candidates,
+        prepared.paths.local_checkpoints,
+        prepared.paths.durable_checkpoints,
+    )
+    identity = prepared.checkpoint_identity.as_dict()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            try:
+                manifest = read_complete_manifest(child)
+            except (ArtifactError, OSError):
+                continue
+            if (
+                manifest.get("kind") not in {"rolling", "epoch"}
+                or any(manifest.get(key) != value for key, value in identity.items())
+            ):
+                continue
+            step = manifest.get("global_step")
+            if isinstance(step, bool) or not isinstance(step, int) or step <= 0:
+                continue
+            fingerprint = sha256_file(child / "manifest.json")
+            previous = sources.get(step)
+            if previous is None:
+                sources[step] = (child, manifest, fingerprint)
+            elif previous[2] != fingerprint:
+                raise WorkflowError(f"multiple retained checkpoints differ at global_step={step}")
+
+    for checkpoint in epochs:
+        try:
+            manifest = read_complete_manifest(checkpoint.path)
+        except (ArtifactError, OSError) as exc:
+            raise WorkflowError(
+                f"durable epoch checkpoint is incomplete: {checkpoint.path}"
+            ) from exc
+        previous = sources.get(checkpoint.global_step)
+        current = (checkpoint.path, manifest, checkpoint.checkpoint_fingerprint)
+        if previous is None:
+            sources[checkpoint.global_step] = current
+        elif previous[2] != checkpoint.checkpoint_fingerprint:
+            raise WorkflowError(
+                f"retained and durable checkpoints differ at step {checkpoint.global_step}"
+            )
+    return sources
+
+
+def resolve_checkpoint_candidates(
+    prepared: PreparedRun,
+    checkpoints: Sequence[EpochCheckpoint] | None = None,
+) -> tuple[EpochCheckpoint, ...]:
+    """Return only the exact train-loss minimum and the final checkpoint."""
+
+    epochs = tuple(checkpoints or enumerate_epoch_checkpoints(prepared))
+    if len(epochs) != prepared.config.train.epochs:
+        raise WorkflowError("checkpoint resolution requires all completed epoch checkpoints")
+    final_epoch = epochs[-1]
+    if final_epoch.epoch != float(prepared.config.train.epochs):
+        raise WorkflowError("last durable checkpoint is not the configured final epoch")
+
+    losses = _load_exact_train_losses(prepared)
+    eligible_losses = {
+        step: value
+        for step, value in losses.items()
+        if step % prepared.config.train.checkpoint_steps == 0
+        or step == final_epoch.global_step
+    }
+    if final_epoch.global_step not in eligible_losses:
+        raise WorkflowError("final checkpoint has no train loss logged at its exact step")
+    minimum_step, (minimum_loss, _) = min(
+        eligible_losses.items(),
+        key=lambda item: (item[1][0], item[0]),
+    )
+
+    sources = _saved_checkpoint_sources(prepared, epochs)
+    if minimum_step not in sources:
+        raise WorkflowError(
+            "the exact train-loss minimum checkpoint was not retained: "
+            f"global_step={minimum_step}, train_loss={minimum_loss}"
+        )
+    final_loss = eligible_losses[final_epoch.global_step][0]
+    final = EpochCheckpoint(
+        epoch=final_epoch.epoch,
+        global_step=final_epoch.global_step,
+        path=final_epoch.path,
+        checkpoint_fingerprint=final_epoch.checkpoint_fingerprint,
+        kind="final",
+        train_loss=final_loss,
+    )
+
+    minimum_source, minimum_manifest, minimum_source_fingerprint = sources[minimum_step]
+    if minimum_step == final.global_step:
+        candidates = (final,)
+    elif minimum_manifest.get("kind") == "epoch":
+        minimum = EpochCheckpoint(
+            epoch=float(minimum_manifest["epoch"]),
+            global_step=minimum_step,
+            path=minimum_source,
+            checkpoint_fingerprint=minimum_source_fingerprint,
+            kind="train-loss",
+            train_loss=minimum_loss,
+        )
+        candidates = (minimum, final)
+    else:
+        final_manifest = read_complete_manifest(final.path)
+        initial_fingerprint = final_manifest.get("pissa_initial_adapter_fingerprint")
+        if not isinstance(initial_fingerprint, str):
+            raise WorkflowError("final checkpoint lacks the PiSSA initialization fingerprint")
+        destination = (
+            prepared.paths.evaluation_checkpoints
+            / (
+                f"train-loss-step-{minimum_step:09d}-"
+                f"{minimum_source_fingerprint[:16]}"
+            )
+        )
+        materialized = materialize_train_loss_checkpoint(
+            minimum_source,
+            destination,
+            identity=prepared.checkpoint_identity,
+            initial_adapter_dir=prepared.bundle_dir / "pissa_init",
+            portable_config_template=final.path / "portable_adapter" / "adapter_config.json",
+            expected_initial_adapter_fingerprint=initial_fingerprint,
+            train_loss=minimum_loss,
+        )
+        materialized_manifest = read_complete_manifest(materialized)
+        minimum = EpochCheckpoint(
+            epoch=float(materialized_manifest["epoch"]),
+            global_step=minimum_step,
+            path=materialized,
+            checkpoint_fingerprint=sha256_file(materialized / "manifest.json"),
+            kind="train-loss",
+            train_loss=minimum_loss,
+        )
+        candidates = (minimum, final)
+
+    report = {
+        "schema_version": "janus-ts-checkpoint-candidates-v1",
+        "run_fingerprint": prepared.run_identity.fingerprint,
+        "selection_scope": "validation-only",
+        "train_loss_definition": (
+            "rank-zero logged train loss at the exact saved checkpoint global_step"
+        ),
+        "candidates": [
+            {
+                "role": candidate.kind,
+                "epoch": candidate.epoch,
+                "global_step": candidate.global_step,
+                "train_loss": candidate.train_loss,
+                "path": str(candidate.path.resolve()),
+                "checkpoint_fingerprint": candidate.checkpoint_fingerprint,
+            }
+            for candidate in candidates
+        ],
+        "deduplicated": len(candidates) == 1,
+    }
+    report_path = prepared.paths.project / "workflow" / "checkpoint-candidates.json"
+    if report_path.exists():
+        if _read_json(report_path) != report:
+            raise WorkflowError("checkpoint candidate report differs from resolved candidates")
+    else:
+        write_json(report_path, report)
+    return candidates
 
 
 def run_training_phase(
@@ -1831,7 +2223,10 @@ def _run_portable_parity_gate(
     stage = (
         prepared.paths.project
         / "workflow"
-        / f"portable-parity-epoch-{checkpoint.epoch}-{checkpoint.checkpoint_fingerprint}"
+        / (
+            f"portable-parity-step-{checkpoint.global_step:09d}-"
+            f"{checkpoint.checkpoint_fingerprint}"
+        )
     )
     if report := load_stage(
         stage,
@@ -1858,7 +2253,7 @@ def _run_portable_parity_gate(
         str(raw_report),
     )
     outcome = run_locked_gpu_command(
-        f"portable-parity-epoch-{checkpoint.epoch}",
+        f"portable-parity-step-{checkpoint.global_step:09d}",
         command,
         lock_path=prepared.config.runtime.gpu_lock_path,
         required_gpu_count=prepared.config.runtime.required_gpu_count,
@@ -1924,7 +2319,10 @@ def _run_one_formal_evaluation(
     stage = (
         prepared.paths.project
         / "workflow"
-        / f"{split}-epoch-{checkpoint.epoch}-{checkpoint.checkpoint_fingerprint}"
+        / (
+            f"{split}-step-{checkpoint.global_step:09d}-"
+            f"{checkpoint.checkpoint_fingerprint}"
+        )
     )
     if (
         load_stage(
@@ -1985,7 +2383,7 @@ def _run_one_formal_evaluation(
         )
         return metrics, predictions
     outcome = run_locked_gpu_command(
-        f"formal-{split}-epoch-{checkpoint.epoch}",
+        f"formal-{split}-step-{checkpoint.global_step:09d}",
         _formal_eval_command(
             prepared,
             checkpoint,
@@ -2029,6 +2427,7 @@ def _write_or_validate_selection_proof(
         run_fingerprint=prepared.run_identity.fingerprint,
         selected_checkpoint_fingerprint=selected.checkpoint_fingerprint,
         selected_epoch=selected.epoch,
+        selected_global_step=selected.global_step,
     )
     path = prepared.paths.evaluations / "selection-proof.json"
     if path.exists():
@@ -2262,7 +2661,7 @@ def _write_inference_mode_comparison(
 
     output = prepared.paths.evaluations / "inference-mode-comparison.json"
     payload = {
-        "schema_version": "janus-ts-four-mode-comparison-v2",
+        "schema_version": "janus-ts-four-mode-comparison-v3",
         "data_fingerprint": prepared.run_identity.data_fingerprint,
         "run_fingerprint": prepared.run_identity.fingerprint,
         "test_count": 996,
@@ -2274,6 +2673,9 @@ def _write_inference_mode_comparison(
         ],
         "fine_tuned_qwen": {
             "selected_epoch": selected.epoch,
+            "selected_global_step": selected.global_step,
+            "selected_checkpoint_role": selected.kind,
+            "selected_checkpoint_train_loss": selected.train_loss,
             "checkpoint_fingerprint": selected.checkpoint_fingerprint,
             "non_thinking": {
                 "metrics_sha256": sha256_file(selected_metrics),
@@ -2325,10 +2727,11 @@ def run_evaluation_phase(
     from .formal_eval_runtime import load_checkpoint_score
 
     epochs = tuple(checkpoints or enumerate_epoch_checkpoints(prepared))
-    if len(epochs) != prepared.config.train.epochs:
-        raise WorkflowError("formal selection requires all five epoch checkpoints")
+    candidates = resolve_checkpoint_candidates(prepared, epochs)
+    if not 1 <= len(candidates) <= 2:
+        raise WorkflowError("formal selection requires one or two deduplicated candidates")
     scores = []
-    for checkpoint in epochs:
+    for checkpoint in candidates:
         metrics, _ = _run_one_formal_evaluation(
             prepared,
             checkpoint,
@@ -2347,12 +2750,17 @@ def run_evaluation_phase(
     winner_score = select_best_checkpoint(scores)
     matches = [
         checkpoint
-        for checkpoint in epochs
+        for checkpoint in candidates
         if checkpoint.checkpoint_fingerprint == winner_score.checkpoint_id
-        and checkpoint.epoch == winner_score.epoch
+        and math.isclose(
+            checkpoint.epoch,
+            winner_score.epoch,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
     ]
     if len(matches) != 1:
-        raise WorkflowError("formal score winner does not map to exactly one epoch checkpoint")
+        raise WorkflowError("formal score winner does not map to exactly one candidate")
     selected = matches[0]
     proof = _write_or_validate_selection_proof(prepared, selected)
     _advance_run_state(
@@ -2360,6 +2768,9 @@ def run_evaluation_phase(
         stage="selected",
         global_step=epochs[-1].global_step,
         selected_epoch=selected.epoch,
+        selected_global_step=selected.global_step,
+        selected_checkpoint_role=selected.kind,
+        selected_checkpoint_train_loss=selected.train_loss,
         selected_checkpoint_fingerprint=selected.checkpoint_fingerprint,
     )
     _advance_run_state(
@@ -2406,6 +2817,9 @@ def run_evaluation_phase(
         stage="complete",
         global_step=epochs[-1].global_step,
         selected_epoch=selected.epoch,
+        selected_global_step=selected.global_step,
+        selected_checkpoint_role=selected.kind,
+        selected_checkpoint_train_loss=selected.train_loss,
         selected_checkpoint_fingerprint=selected.checkpoint_fingerprint,
         test_evaluated=True,
         zero_shot_baseline_evaluated=True,
@@ -2471,6 +2885,7 @@ __all__ = [
     "make_checkpoint_callback_factory",
     "prepare_smoke_workflow",
     "project_executable",
+    "resolve_checkpoint_candidates",
     "run_cpu_audits",
     "run_delegated_command",
     "run_distributed_training_worker",

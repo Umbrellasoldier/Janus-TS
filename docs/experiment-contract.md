@@ -146,7 +146,9 @@ headers through `CPATH`, which Triton needs to compile its driver helper.
 Checkpoint 0 is written after PiSSA plus optimizer/scheduler initialization
 and before the first real update. During an epoch a complete resume checkpoint
 is written every 50 optimizer steps and only the latest two local copies are
-retained. Every epoch writes a durable full resume checkpoint and a portable
+retained. The rolling checkpoint whose exact-step logged train loss is best so
+far is hard-linked into one protected local candidate before rotation. Every
+epoch writes a durable full resume checkpoint and a portable
 ordinary-LoRA adapter. The portable conversion has rank 64, alpha `16*sqrt(2)`
 and 466,911,232 parameters. Completion markers are written atomically, and
 resume selection uses manifest `global_step` plus fingerprints, never mtime.
@@ -185,16 +187,18 @@ in priority order, are:
 
 Checkpoint selection compares the @10 values lexicographically in that order.
 Loss differences no larger than 1e-8 are ties, resolved in favor of the
-earlier epoch. Report exact integer/rational aggregates, Wilson confidence
+earlier training position. Report exact integer/rational aggregates, Wilson confidence
 intervals for the two binary metrics, and reaction-level BCa intervals with
 10,000 seed-42 replicates for mean auxiliary metrics; also report edit P50/P95.
 
-All five sealed epoch checkpoints are evaluated on the 994-example validation
-set after training; Trainer does not run a second implicit validation pass
-inside the training epoch. This keeps each durable checkpoint at the true
-post-training boundary and makes its saved RNG state the state entering the
-next epoch. After locking the selected checkpoint, the complete 996-example
-test split is run in this order:
+Only two checkpoints are eligible for the 994-example validation set after
+training: (1) the actually saved checkpoint with the lowest train loss logged
+at that exact `global_step`, and (2) the final checkpoint. If they are the same
+checkpoint, validation is deduplicated to one run. A rolling train-loss
+candidate is converted once from its rank-32 PiSSA form into a compact rank-64
+evaluation checkpoint; optimizer state is not copied. No other checkpoint is
+validated. After locking the winner, only that fine-tuned checkpoint is
+evaluated on the complete 996-example test split, in this overall order:
 
 1. original Qwen zero-shot, non-thinking;
 2. original Qwen zero-shot, thinking;

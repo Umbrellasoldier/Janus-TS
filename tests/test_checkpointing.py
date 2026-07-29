@@ -22,6 +22,7 @@ from janus_ts.checkpointing import (
     ResumeCheckpoint,
     convert_pissa_to_portable_state,
     gather_lora_state_dict,
+    materialize_train_loss_checkpoint,
     normalize_lora_state_dict,
     select_resume_checkpoint,
 )
@@ -247,6 +248,114 @@ def test_pissa_portable_conversion_is_exact_rank_doubling():
     assert torch.equal(portable["x.lora_B.weight"], torch.tensor([[3.0, -7.0], [4.0, -8.0]]))
     with pytest.raises(CheckpointError, match="keys differ"):
         convert_pissa_to_portable_state(trained, {"other.lora_A.weight": torch.ones(1, 2)})
+
+
+def test_rolling_checkpoint_materializes_as_compact_train_loss_candidate(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    run_identity = identity()
+    source = tmp_path / "resume-step-000000050"
+    complete_manifest(
+        source,
+        run_identity=run_identity,
+        step=50,
+        kind="rolling",
+        epoch=0.5,
+    )
+    source_manifest = read_complete_manifest(source)
+    tag_root = source / "deepspeed" / "global_step000000050"
+    (tag_root / "zero_pp_rank_1_mp_rank_00_optim_states.pt").write_bytes(
+        b"optimizer-rank-1"
+    )
+
+    adapter_config = {
+        "r": 32,
+        "lora_alpha": 16.0,
+        "use_rslora": True,
+        "init_lora_weights": True,
+        "inference_mode": True,
+        "rank_pattern": {},
+        "alpha_pattern": {},
+        "target_modules": ["proj"],
+    }
+    trained = {
+        "model.proj.lora_A.weight": torch.tensor([[3.0, 4.0]]),
+        "model.proj.lora_B.weight": torch.tensor([[5.0], [6.0]]),
+    }
+    initial = {
+        "model.proj.lora_A.weight": torch.tensor([[1.0, 2.0]]),
+        "model.proj.lora_B.weight": torch.tensor([[2.0], [3.0]]),
+    }
+    resume = source / "resume_adapter"
+    resume.mkdir()
+    (resume / "adapter_config.json").write_text(
+        json.dumps(adapter_config),
+        encoding="utf-8",
+    )
+    save_file(trained, resume / "adapter_model.safetensors")
+
+    initial_root = tmp_path / "pissa_init"
+    initial_root.mkdir()
+    (initial_root / "adapter_config.json").write_text(
+        json.dumps(adapter_config),
+        encoding="utf-8",
+    )
+    save_file(initial, initial_root / "adapter_model.safetensors")
+
+    portable_config = {
+        **adapter_config,
+        "r": 64,
+        "lora_alpha": 16.0 * (2.0**0.5),
+    }
+    template = tmp_path / "portable-config.json"
+    template.write_text(json.dumps(portable_config), encoding="utf-8")
+
+    source_manifest["world_size"] = 2
+    source_manifest["payload_inventory"] = checkpointing._payload_inventory(source)
+    mark_complete(source, source_manifest)
+    destination = tmp_path / "evaluation-checkpoint"
+    result = materialize_train_loss_checkpoint(
+        source,
+        destination,
+        identity=run_identity,
+        initial_adapter_dir=initial_root,
+        portable_config_template=template,
+        expected_initial_adapter_fingerprint=checkpointing._hash_tree(initial_root),
+        train_loss=0.125,
+    )
+
+    assert result == destination
+    manifest = read_complete_manifest(destination)
+    assert manifest["kind"] == "train-loss"
+    assert manifest["global_step"] == 50
+    assert manifest["train_loss"] == 0.125
+    assert set(manifest["payload_inventory"]) == {
+        "resume_adapter/adapter_config.json",
+        "resume_adapter/adapter_model.safetensors",
+        "portable_adapter/adapter_config.json",
+        "portable_adapter/adapter_model.safetensors",
+    }
+    portable = load_file(destination / "portable_adapter" / "adapter_model.safetensors")
+    assert torch.equal(
+        portable["model.proj.lora_A.weight"],
+        torch.tensor([[3.0, 4.0], [1.0, 2.0]]),
+    )
+    assert torch.equal(
+        portable["model.proj.lora_B.weight"],
+        torch.tensor([[5.0, -2.0], [6.0, -3.0]]),
+    )
+    assert (
+        materialize_train_loss_checkpoint(
+            source,
+            destination,
+            identity=run_identity,
+            initial_adapter_dir=initial_root,
+            portable_config_template=template,
+            expected_initial_adapter_fingerprint=checkpointing._hash_tree(initial_root),
+            train_loss=0.125,
+        )
+        == destination
+    )
 
 
 def test_adapter_key_normalization_rejects_wrong_adapter():

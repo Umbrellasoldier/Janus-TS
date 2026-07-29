@@ -52,7 +52,7 @@ from .tokenization import (
 )
 
 GENERATION_SCHEMA_VERSION = "janus-ts-formal-generation-jsonl-v1"
-SELECTION_SCHEMA_VERSION = "janus-ts-checkpoint-selection-v1"
+SELECTION_SCHEMA_VERSION = "janus-ts-checkpoint-selection-v2"
 EVALUATION_SCHEMA_VERSION = "janus-ts-formal-evaluation-v1"
 TEST_COMPLETION_SCHEMA_VERSION = "janus-ts-test-evaluation-complete-v1"
 EXPECTED_FORMAL_SPLIT_COUNTS = {"val": 994, "test": 996}
@@ -706,7 +706,8 @@ class SelectionProof:
     data_fingerprint: str
     run_fingerprint: str
     selected_checkpoint_fingerprint: str
-    selected_epoch: int
+    selected_epoch: float
+    selected_global_step: int
 
     def __post_init__(self) -> None:
         _validate_sha256(self.data_fingerprint, name="data_fingerprint")
@@ -717,10 +718,17 @@ class SelectionProof:
         )
         if (
             isinstance(self.selected_epoch, bool)
-            or not isinstance(self.selected_epoch, int)
+            or not isinstance(self.selected_epoch, (int, float))
+            or not math.isfinite(float(self.selected_epoch))
             or self.selected_epoch <= 0
         ):
-            raise GenerationContractError("selected_epoch must be a positive integer")
+            raise GenerationContractError("selected_epoch must be positive and finite")
+        if (
+            isinstance(self.selected_global_step, bool)
+            or not isinstance(self.selected_global_step, int)
+            or self.selected_global_step <= 0
+        ):
+            raise GenerationContractError("selected_global_step must be a positive integer")
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -730,6 +738,7 @@ class SelectionProof:
             "run_fingerprint": self.run_fingerprint,
             "selected_checkpoint_fingerprint": self.selected_checkpoint_fingerprint,
             "selected_epoch": self.selected_epoch,
+            "selected_global_step": self.selected_global_step,
         }
 
 
@@ -740,6 +749,7 @@ _SELECTION_KEYS = {
     "run_fingerprint",
     "selected_checkpoint_fingerprint",
     "selected_epoch",
+    "selected_global_step",
 }
 
 
@@ -772,6 +782,7 @@ def load_selection_proof(path: str | Path, identity: GenerationIdentity) -> Sele
         run_fingerprint=payload["run_fingerprint"],
         selected_checkpoint_fingerprint=payload["selected_checkpoint_fingerprint"],
         selected_epoch=payload["selected_epoch"],
+        selected_global_step=payload["selected_global_step"],
     )
     if identity.split != "test":
         raise GenerationContractError("a selection proof may only authorize test evaluation")

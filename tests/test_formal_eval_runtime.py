@@ -47,8 +47,9 @@ def _complete_checkpoint(
     *,
     data_fingerprint: str,
     config_fingerprint: str,
-    epoch: int = 3,
+    epoch: float = 3,
     global_step: int = 150,
+    kind: str = "epoch",
 ) -> Path:
     adapter = root / "portable_adapter"
     adapter.mkdir(parents=True)
@@ -65,7 +66,7 @@ def _complete_checkpoint(
         root,
         {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "kind": "epoch",
+            "kind": kind,
             "run_fingerprint": "a" * 64,
             "config_fingerprint": config_fingerprint,
             "data_fingerprint": data_fingerprint,
@@ -76,6 +77,7 @@ def _complete_checkpoint(
             "exclude_frozen_parameters": True,
             "pissa_initial_adapter_fingerprint": "e" * 64,
             "payload_inventory": inventory,
+            **({"train_loss": 0.125} if kind == "train-loss" else {}),
         },
     )
     return root
@@ -167,6 +169,23 @@ def test_durable_checkpoint_identity_and_portable_payload_are_content_verified(
     weights.write_bytes(b"tampered")
     with pytest.raises(FormalEvalRuntimeError, match="size mismatch|digest mismatch"):
         inspect_durable_checkpoint(checkpoint_dir, processed, config=config)
+
+
+def test_fractional_train_loss_checkpoint_is_valid_for_formal_evaluation(tmp_path):
+    config = load_config("configs/transition1x.yaml")
+    processed = _complete_processed(tmp_path / "processed", "d" * 64)
+    checkpoint_dir = _complete_checkpoint(
+        tmp_path / "checkpoint",
+        data_fingerprint="d" * 64,
+        config_fingerprint=config.sha256,
+        epoch=2.75,
+        global_step=1370,
+        kind="train-loss",
+    )
+
+    checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed, config=config)
+    assert checkpoint.epoch == 2.75
+    assert checkpoint.global_step == 1370
 
 
 class _TinyPortableModel(torch.nn.Module):
@@ -416,6 +435,7 @@ def test_completed_test_rebuilds_missing_receipt_and_never_loads_model(
             run_fingerprint=checkpoint.run_fingerprint,
             selected_checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
             selected_epoch=checkpoint.epoch,
+            selected_global_step=checkpoint.global_step,
         ),
     )
 

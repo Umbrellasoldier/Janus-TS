@@ -1,6 +1,6 @@
 """Two-rank ZeRO-3 runtime for formal checkpoint evaluation.
 
-Each invocation evaluates one durable epoch checkpoint.  The ordinary rank-64
+Each invocation evaluates one durable candidate checkpoint.  The ordinary rank-64
 portable adapter is loaded over the pinned *original* Qwen base (not the PiSSA
 residual base) after :class:`~transformers.TrainingArguments` has activated
 ZeRO-3 Init.  Validation first obtains ``eval_loss`` through ``Trainer`` and
@@ -101,7 +101,7 @@ class FormalEvalRuntimeError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class DurableCheckpoint:
-    """Content-verified identity of one durable epoch checkpoint."""
+    """Content-verified identity of one durable evaluation checkpoint."""
 
     path: Path
     portable_adapter_path: Path
@@ -110,7 +110,7 @@ class DurableCheckpoint:
     run_fingerprint: str
     config_fingerprint: str
     model_fingerprint: str
-    epoch: int
+    epoch: float
     global_step: int
     manifest: Mapping[str, Any]
 
@@ -323,20 +323,26 @@ def inspect_durable_checkpoint(
 
     if manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise FormalEvalRuntimeError("unsupported durable checkpoint schema")
-    if manifest.get("kind") != "epoch":
-        raise FormalEvalRuntimeError("formal evaluation requires a durable epoch checkpoint")
+    kind = manifest.get("kind")
+    if kind not in {"epoch", "train-loss"}:
+        raise FormalEvalRuntimeError(
+            "formal evaluation requires an epoch or train-loss checkpoint"
+        )
     raw_epoch = manifest.get("epoch")
     try:
         epoch_float = float(raw_epoch)
     except (TypeError, ValueError) as exc:
         raise FormalEvalRuntimeError(f"invalid durable epoch: {raw_epoch!r}") from exc
-    if (
-        not math.isfinite(epoch_float)
-        or epoch_float < 1
-        or not math.isclose(epoch_float, round(epoch_float), rel_tol=0.0, abs_tol=1e-8)
+    if not math.isfinite(epoch_float) or epoch_float <= 0:
+        raise FormalEvalRuntimeError(f"durable epoch is not positive and finite: {raw_epoch!r}")
+    if kind == "epoch" and not math.isclose(
+        epoch_float,
+        round(epoch_float),
+        rel_tol=0.0,
+        abs_tol=1e-8,
     ):
-        raise FormalEvalRuntimeError(f"durable epoch is not a positive integer: {raw_epoch!r}")
-    epoch = int(round(epoch_float))
+        raise FormalEvalRuntimeError(f"durable epoch is not an integer: {raw_epoch!r}")
+    epoch = float(round(epoch_float)) if kind == "epoch" else epoch_float
     if config is not None and epoch > config.train.epochs:
         raise FormalEvalRuntimeError(
             f"checkpoint epoch {epoch} exceeds configured {config.train.epochs} epochs"
@@ -348,6 +354,15 @@ def inspect_durable_checkpoint(
         raise FormalEvalRuntimeError("durable checkpoint was not produced by exactly two ranks")
     if manifest.get("exclude_frozen_parameters") is not True:
         raise FormalEvalRuntimeError("durable checkpoint did not exclude the frozen base")
+    if kind == "train-loss":
+        train_loss = manifest.get("train_loss")
+        if (
+            isinstance(train_loss, bool)
+            or not isinstance(train_loss, (int, float))
+            or not math.isfinite(float(train_loss))
+            or float(train_loss) < 0.0
+        ):
+            raise FormalEvalRuntimeError("train-loss checkpoint has an invalid train_loss")
 
     data_fingerprint = _require_sha256(
         manifest.get("data_fingerprint"), name="checkpoint data_fingerprint"
@@ -987,10 +1002,22 @@ def run_formal_checkpoint_evaluation(
     checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed_path, config=config)
     output_root = Path(output_dir)
     if split == "test":
-        load_selection_proof(
+        proof = load_selection_proof(
             selection_proof_path,
             checkpoint.generation_identity("test"),
         )
+        if (
+            proof.selected_global_step != checkpoint.global_step
+            or not math.isclose(
+                float(proof.selected_epoch),
+                checkpoint.epoch,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise FormalEvalRuntimeError(
+                "selection proof training position differs from selected checkpoint"
+            )
         recovered = recover_completed_test(output_root, checkpoint)
         if recovered is not None:
             return recovered

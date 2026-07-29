@@ -407,6 +407,217 @@ def _write_portable_adapter(
     return before
 
 
+def _read_json_object(path: Path, *, description: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CheckpointError(f"cannot read {description} {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CheckpointError(f"{description} must be a JSON object: {path}")
+    return payload
+
+
+def _link_or_copy_file(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except OSError as exc:
+        if exc.errno != getattr(os, "EXDEV", 18):
+            raise
+        shutil.copy2(source, destination)
+
+
+def _validate_materialized_train_loss_checkpoint(
+    root: Path,
+    *,
+    identity: CheckpointIdentity,
+    source_checkpoint_fingerprint: str,
+    train_loss: float,
+) -> Mapping[str, Any]:
+    try:
+        manifest = read_complete_manifest(root)
+    except ArtifactError as exc:
+        raise CheckpointError(str(exc)) from exc
+    if manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+        raise CheckpointError("unsupported materialized checkpoint schema")
+    if manifest.get("kind") != "train-loss":
+        raise CheckpointError("materialized checkpoint kind is not train-loss")
+    if _manifest_identity(manifest) != identity:
+        raise CheckpointError("materialized checkpoint belongs to another run")
+    if manifest.get("source_checkpoint_fingerprint") != source_checkpoint_fingerprint:
+        raise CheckpointError("materialized checkpoint source differs")
+    if manifest.get("train_loss") != train_loss:
+        raise CheckpointError("materialized checkpoint train loss differs")
+    step, epoch = _validate_step_epoch(
+        manifest.get("global_step"),
+        manifest.get("epoch"),
+        kind="rolling",
+    )
+    if step <= 0 or epoch <= 0:
+        raise CheckpointError("materialized checkpoint has an invalid training position")
+    _verify_payload_inventory(root, manifest.get("payload_inventory"))
+    expected = {
+        f"{RESUME_ADAPTER_SUBDIR}/adapter_config.json",
+        f"{RESUME_ADAPTER_SUBDIR}/adapter_model.safetensors",
+        f"{PORTABLE_ADAPTER_SUBDIR}/adapter_config.json",
+        f"{PORTABLE_ADAPTER_SUBDIR}/adapter_model.safetensors",
+    }
+    inventory = manifest["payload_inventory"]
+    if set(inventory) != expected:
+        raise CheckpointError("materialized checkpoint has unexpected payload files")
+    return manifest
+
+
+def materialize_train_loss_checkpoint(
+    source_checkpoint: str | Path,
+    destination: str | Path,
+    *,
+    identity: CheckpointIdentity,
+    initial_adapter_dir: str | Path,
+    portable_config_template: str | Path,
+    expected_initial_adapter_fingerprint: str,
+    train_loss: float,
+) -> Path:
+    """Convert one retained rolling checkpoint into a compact eval checkpoint.
+
+    The rolling tree is validated as a complete resume checkpoint.  Its
+    rank-32 adapter is then combined with the immutable PiSSA initialization
+    to produce the exact rank-64 portable adapter used by formal evaluation.
+    Optimizer, scheduler, RNG, and DeepSpeed shards are deliberately omitted.
+    """
+
+    from safetensors.torch import load_file, save_file
+
+    if isinstance(train_loss, bool) or not isinstance(train_loss, (int, float)):
+        raise CheckpointError(f"invalid train loss: {train_loss!r}")
+    loss = float(train_loss)
+    if not math.isfinite(loss) or loss < 0.0:
+        raise CheckpointError(f"invalid train loss: {train_loss!r}")
+    if (
+        not isinstance(expected_initial_adapter_fingerprint, str)
+        or _FINGERPRINT_RE.fullmatch(expected_initial_adapter_fingerprint) is None
+    ):
+        raise CheckpointError("expected PiSSA initialization fingerprint is invalid")
+
+    source = Path(source_checkpoint).resolve(strict=True)
+    try:
+        source_manifest = read_complete_manifest(source)
+    except ArtifactError as exc:
+        raise CheckpointError(str(exc)) from exc
+    step, epoch, kind = _validate_checkpoint_payload(
+        source,
+        source_manifest,
+        identity,
+        expected_world_size=2,
+    )
+    if kind != "rolling":
+        raise CheckpointError(f"train-loss materialization requires rolling, got {kind!r}")
+    source_fingerprint = sha256_file(source / "manifest.json")
+
+    target = Path(destination)
+    if target.exists():
+        _validate_materialized_train_loss_checkpoint(
+            target,
+            identity=identity,
+            source_checkpoint_fingerprint=source_fingerprint,
+            train_loss=loss,
+        )
+        return target
+
+    initial_root = Path(initial_adapter_dir).resolve(strict=True)
+    initial_fingerprint = _hash_tree(initial_root)
+    if initial_fingerprint != expected_initial_adapter_fingerprint:
+        raise CheckpointError("PiSSA initialization fingerprint differs from final checkpoint")
+
+    resume_root = source / RESUME_ADAPTER_SUBDIR
+    resume_files = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    }
+    actual_resume_files = {
+        path.relative_to(resume_root).as_posix()
+        for path in resume_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_resume_files != resume_files:
+        raise CheckpointError(
+            f"rolling resume adapter files differ: {sorted(actual_resume_files)!r}"
+        )
+
+    trained_config = _read_json_object(
+        resume_root / "adapter_config.json",
+        description="rolling adapter config",
+    )
+    portable_config = copy.deepcopy(trained_config)
+    if (
+        portable_config.get("r") != 32
+        or not math.isclose(
+            float(portable_config.get("lora_alpha", math.nan)),
+            16.0,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+        or portable_config.get("use_rslora") is not True
+        or portable_config.get("init_lora_weights") is not True
+        or portable_config.get("rank_pattern") not in ({}, None)
+        or portable_config.get("alpha_pattern") not in ({}, None)
+    ):
+        raise CheckpointError("rolling adapter config violates the rank-32 PiSSA contract")
+    portable_config["r"] = 64
+    portable_config["lora_alpha"] = 16.0 * math.sqrt(2.0)
+    portable_config["inference_mode"] = True
+
+    template_path = Path(portable_config_template).resolve(strict=True)
+    template = _read_json_object(template_path, description="portable config template")
+    if portable_config != template:
+        raise CheckpointError("derived portable config differs from final checkpoint template")
+
+    initial_weights = initial_root / "adapter_model.safetensors"
+    trained_state = load_file(resume_root / "adapter_model.safetensors", device="cpu")
+    initial_state = load_file(initial_weights, device="cpu")
+    portable_state = convert_pissa_to_portable_state(trained_state, initial_state)
+
+    from .artifacts import atomic_directory
+
+    with atomic_directory(target) as staging:
+        staged_resume = staging / RESUME_ADAPTER_SUBDIR
+        staged_resume.mkdir()
+        for name in sorted(resume_files):
+            _link_or_copy_file(resume_root / name, staged_resume / name)
+
+        staged_portable = staging / PORTABLE_ADAPTER_SUBDIR
+        staged_portable.mkdir()
+        write_json(staged_portable / "adapter_config.json", template)
+        save_file(
+            portable_state,
+            staged_portable / "adapter_model.safetensors",
+            metadata={"format": "pt"},
+        )
+        manifest = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "kind": "train-loss",
+            **identity.as_dict(),
+            "global_step": step,
+            "epoch": epoch,
+            "world_size": source_manifest["world_size"],
+            "exclude_frozen_parameters": True,
+            "pissa_initial_adapter_fingerprint": initial_fingerprint,
+            "train_loss": loss,
+            "source_checkpoint_kind": kind,
+            "source_checkpoint_fingerprint": source_fingerprint,
+            "portable_config_template_sha256": sha256_file(template_path),
+            "payload_inventory": _payload_inventory(staging),
+        }
+        mark_complete(staging, manifest)
+
+    _validate_materialized_train_loss_checkpoint(
+        target,
+        identity=identity,
+        source_checkpoint_fingerprint=source_fingerprint,
+        train_loss=loss,
+    )
+    return target
+
+
 def _capture_rng_state() -> dict[str, Any]:
     import torch
 
@@ -1298,6 +1509,7 @@ __all__ = [
     "TorchDistributedCoordinator",
     "convert_pissa_to_portable_state",
     "gather_lora_state_dict",
+    "materialize_train_loss_checkpoint",
     "normalize_lora_state_dict",
     "select_resume_checkpoint",
 ]

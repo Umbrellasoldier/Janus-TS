@@ -69,7 +69,7 @@ class ThinkingModelBinding:
     run_fingerprint: str
     model_fingerprint: str
     checkpoint_fingerprint: str
-    epoch: int
+    epoch: float
     global_step: int
     checkpoint_path: Path | None
 

@@ -31,11 +31,12 @@ there is no candidate search or duplicate 27B pretraining run.
 `train run` repeats or verifies those lightweight content-addressed gates,
 resumes the greatest valid local/durable manifest step, and starts the formal
 five-epoch training directly.
-It then checks each epoch's rank-64 portable adapter against its rank-32 resume
-form before formal validation. Epoch 1 also gates the real longest-prompt
-beam-10 formal generation path and a separate forced-full-512-token memory
-stress decode. After the @10 lexicographic winner is locked, the complete
-996-reaction test split runs in this order: raw-Qwen non-thinking, raw-Qwen
+It retains the exact-step train-loss minimum checkpoint and compares only that
+checkpoint and the final checkpoint on validation (one run if they coincide).
+Each candidate's rank-64 portable adapter is checked against its rank-32
+resume form before formal validation. After the @10 lexicographic winner is
+locked, only that fine-tuned checkpoint is used for the complete
+996-reaction test split. The four modes run in this order: raw-Qwen non-thinking, raw-Qwen
 thinking, selected-checkpoint non-thinking, selected-checkpoint thinking.
 Non-thinking uses deterministic beam 10 and reports @1/@2/@3/@4/@5/@10.
 Each complete-test thinking call returns ten independently sampled candidates
@@ -51,7 +52,7 @@ steps in addition to TensorBoard output.
 
 In addition to the automatic complete-test evaluations, the `infer thinking`
 command is an explicitly non-formal subset inspection tool. Supply
-the processed dataset and the selected durable epoch checkpoint directly; the
+the processed dataset and the selected durable evaluation checkpoint directly; the
 selection proof contains content fingerprints but does not contain enough path
 information to resolve either directory safely.
 
@@ -59,7 +60,7 @@ information to resolve either directory safely.
 uv run janus-ts infer thinking \
   --config configs/transition1x.yaml \
   --processed-path /absolute/path/to/processed/transition1x/FINGERPRINT \
-  --checkpoint-dir /absolute/path/to/selected/epoch-checkpoint \
+  --checkpoint-dir /absolute/path/to/selected/evaluation-checkpoint \
   --output-dir artifacts/exploration \
   --split val \
   --reaction-id rxn0001 \

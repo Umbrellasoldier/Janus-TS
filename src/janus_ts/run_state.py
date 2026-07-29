@@ -45,6 +45,14 @@ class RunPaths:
         return self.project / "checkpoints"
 
     @property
+    def loss_candidates(self) -> Path:
+        return self.local / "loss-candidates"
+
+    @property
+    def evaluation_checkpoints(self) -> Path:
+        return self.local / "evaluation-checkpoints"
+
+    @property
     def portable_adapters(self) -> Path:
         return self.project / "portable_adapters"
 
