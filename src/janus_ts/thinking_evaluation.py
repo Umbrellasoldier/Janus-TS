@@ -26,6 +26,7 @@ from .artifacts import (
     write_json,
 )
 from .config import ExperimentConfig, load_config
+from .constants import FORMAL_EVAL_K
 from .evaluation import aggregate_evaluations, evaluate_reaction
 from .formal_eval_runtime import (
     DurableCheckpoint,
@@ -47,9 +48,11 @@ from .zero_shot_runtime import (
     zero_shot_generation_module_from_trainer,
 )
 
-THINKING_EVALUATION_SCHEMA_VERSION = "janus-ts-thinking-test-evaluation-v1"
-THINKING_SCORE_ROW_SCHEMA_VERSION = "janus-ts-thinking-score-row-v1"
-THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION = "janus-ts-thinking-runtime-receipt-v1"
+THINKING_EVALUATION_SCHEMA_VERSION = "janus-ts-thinking-test-evaluation-v2"
+THINKING_SCORE_ROW_SCHEMA_VERSION = "janus-ts-thinking-score-row-v2"
+THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION = "janus-ts-thinking-runtime-receipt-v2"
+THINKING_TEST_REPORT_K = FORMAL_EVAL_K
+THINKING_TEST_SAMPLE_COUNT = max(THINKING_TEST_REPORT_K)
 ThinkingRole = Literal["zero-shot", "fine-tuned"]
 _ROLES: tuple[ThinkingRole, ...] = ("zero-shot", "fine-tuned")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -259,6 +262,7 @@ def finalize_thinking_scores(
     if (
         len(records) != expected_count
         or raw_receipt.payload.get("selection_count") != expected_count
+        or raw_receipt.payload.get("sample_count_per_reaction") != THINKING_TEST_SAMPLE_COUNT
     ):
         raise ThinkingEvaluationError(
             f"thinking test requires all {expected_count} records and predictions"
@@ -270,20 +274,38 @@ def finalize_thinking_scores(
     scored_rows: list[dict[str, Any]] = []
     evaluations = []
     extraction_errors: dict[str, int] = {}
+    parse_valid_candidate_count = 0
     for ordinal, (record, raw) in enumerate(zip(records, raw_rows, strict=True)):
         if raw.get("ordinal") != ordinal or raw.get("reaction_id") != record.reaction_id:
             raise ThinkingEvaluationError(f"thinking prediction identity mismatch at {ordinal}")
-        answer, extraction_error = extract_thinking_answer(str(raw.get("raw_response", "")))
-        if extraction_error is not None:
-            extraction_errors[extraction_error] = extraction_errors.get(extraction_error, 0) + 1
+        raw_responses = raw.get("raw_responses")
+        if (
+            raw.get("sample_count") != THINKING_TEST_SAMPLE_COUNT
+            or not isinstance(raw_responses, list)
+            or len(raw_responses) != THINKING_TEST_SAMPLE_COUNT
+            or any(not isinstance(response, str) for response in raw_responses)
+        ):
+            raise ThinkingEvaluationError(
+                f"thinking prediction {ordinal} does not contain "
+                f"{THINKING_TEST_SAMPLE_COUNT} ordered responses"
+            )
+        answers: list[str] = []
+        response_errors: list[str | None] = []
+        for raw_response in raw_responses:
+            answer, extraction_error = extract_thinking_answer(raw_response)
+            answers.append(answer)
+            response_errors.append(extraction_error)
+            if extraction_error is not None:
+                extraction_errors[extraction_error] = extraction_errors.get(extraction_error, 0) + 1
         evaluation = evaluate_reaction(
             record.reaction_id,
-            (answer,),
+            tuple(answers),
             record.ts_edges,
             atom_count=record.atom_count,
-            report_k=(1,),
+            report_k=THINKING_TEST_REPORT_K,
         )
         evaluations.append(evaluation)
+        parse_valid_candidate_count += sum(parse.valid for parse in evaluation.parses)
         scored_rows.append(
             {
                 "schema_version": THINKING_SCORE_ROW_SCHEMA_VERSION,
@@ -291,14 +313,15 @@ def finalize_thinking_scores(
                 "role": binding.role,
                 "ordinal": ordinal,
                 "reaction_id": record.reaction_id,
-                "answer": answer,
-                "extraction_error": extraction_error,
-                "parse_valid": evaluation.parses[0].valid,
-                "parse_error_code": evaluation.parses[0].error_code,
+                "sample_count": THINKING_TEST_SAMPLE_COUNT,
+                "answers": answers,
+                "extraction_errors": response_errors,
+                "parse_valid": [parse.valid for parse in evaluation.parses],
+                "parse_error_codes": [parse.error_code for parse in evaluation.parses],
             }
         )
 
-    report = aggregate_evaluations(evaluations, report_k=(1,))
+    report = aggregate_evaluations(evaluations, report_k=THINKING_TEST_REPORT_K)
     predictions = destination / "scored-predictions.jsonl"
     metrics = destination / "metrics.json"
     _atomic_write(predictions, _jsonl_bytes(scored_rows))
@@ -310,12 +333,12 @@ def finalize_thinking_scores(
             "formal_eligible": False,
             "affects_checkpoint_selection": False,
             "split": "test",
-            "sample_count_per_reaction": 1,
-            "report_k": [1],
+            "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+            "report_k": list(THINKING_TEST_REPORT_K),
             "predictions_sha256": sha256_file(predictions),
             "raw_predictions_sha256": sha256_file(raw_receipt.path / "predictions.jsonl"),
             "extraction_errors": dict(sorted(extraction_errors.items())),
-            "parse_valid_count": sum(item.parses[0].valid for item in evaluations),
+            "parse_valid_candidate_count": parse_valid_candidate_count,
             "evaluation": report.to_json_dict(),
         },
     )
@@ -332,7 +355,8 @@ def finalize_thinking_scores(
             "affects_checkpoint_selection": False,
             "split": "test",
             "test_count": expected_count,
-            "report_k": [1],
+            "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+            "report_k": list(THINKING_TEST_REPORT_K),
             "request_sha256": request_sha256,
             "raw_artifact_path": str(raw_receipt.path.resolve()),
             "raw_predictions_sha256": sha256_file(raw_receipt.path / "predictions.jsonl"),
@@ -362,7 +386,8 @@ def _validate_scored_artifact(path: Path, binding: ThinkingModelBinding) -> Mapp
         "formal_eligible": False,
         "affects_checkpoint_selection": False,
         "split": "test",
-        "report_k": [1],
+        "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+        "report_k": list(THINKING_TEST_REPORT_K),
     }
     if any(manifest.get(name) != value for name, value in expected.items()):
         raise ThinkingEvaluationError("thinking score artifact identity mismatch")
@@ -402,6 +427,8 @@ def validate_thinking_completion(
         "schema_version": THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
         "status": "complete",
         **binding.to_json_dict(),
+        "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+        "report_k": list(THINKING_TEST_REPORT_K),
     }
     if not isinstance(payload, dict) or any(
         payload.get(key) != value for key, value in expected.items()
@@ -413,6 +440,8 @@ def validate_thinking_completion(
         raw_path,
         request_sha256=str(payload.get("request_sha256", "")),
     )
+    if raw.payload.get("sample_count_per_reaction") != THINKING_TEST_SAMPLE_COUNT:
+        raise ThinkingEvaluationError("thinking runtime receipt references the wrong sample count")
     manifest = _validate_scored_artifact(score_path, binding)
     if manifest.get("request_sha256") != raw.payload.get("request_sha256") or payload.get(
         "raw_predictions_sha256"
@@ -488,6 +517,7 @@ def run_thinking_test_evaluation(
             output_dir=output_dir,
             split="test",
             limit=config.data.expected_retained_counts["test"],
+            sample_count_per_reaction=THINKING_TEST_SAMPLE_COUNT,
             local_files_only=local_files_only,
             checkpoint_inspector=lambda *_args, **_kwargs: synthetic,
             model_loader=zero_loader,
@@ -504,6 +534,7 @@ def run_thinking_test_evaluation(
             output_dir=output_dir,
             split="test",
             limit=config.data.expected_retained_counts["test"],
+            sample_count_per_reaction=THINKING_TEST_SAMPLE_COUNT,
             local_files_only=local_files_only,
             checkpoint_inspector=lambda *_args, **_kwargs: checkpoint,
             model_loader=load_zero3_portable_model,
@@ -527,6 +558,8 @@ def run_thinking_test_evaluation(
             "schema_version": THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
             "status": "complete",
             **binding.to_json_dict(),
+            "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+            "report_k": list(THINKING_TEST_REPORT_K),
             "request_sha256": request_sha256,
             "raw_artifact_path": str(raw_receipt.path.resolve()),
             "raw_predictions_sha256": sha256_file(raw_receipt.path / "predictions.jsonl"),
@@ -584,6 +617,8 @@ if __name__ == "__main__":  # pragma: no cover - exercised by torchrun
 __all__ = [
     "THINKING_EVALUATION_SCHEMA_VERSION",
     "THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION",
+    "THINKING_TEST_REPORT_K",
+    "THINKING_TEST_SAMPLE_COUNT",
     "ThinkingEvaluationError",
     "ThinkingEvaluationReceipt",
     "ThinkingModelBinding",

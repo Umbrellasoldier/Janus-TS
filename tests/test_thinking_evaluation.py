@@ -8,6 +8,8 @@ from janus_ts.config import load_config
 from janus_ts.schema import Atom, Edge, MolecularState, ReactionRecord
 from janus_ts.thinking_evaluation import (
     THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    THINKING_TEST_REPORT_K,
+    THINKING_TEST_SAMPLE_COUNT,
     ThinkingModelBinding,
     build_thinking_binding,
     extract_thinking_answer,
@@ -44,18 +46,19 @@ def _small_config():
 def _raw_receipt(tmp_path: Path) -> ThinkingExplorationReceipt:
     root = tmp_path / "raw"
     root.mkdir()
+    correct = "reasoning</think>\n\n<TS_EDGES>\na0 --[bo=1.5]-- a1\n</TS_EDGES><|im_end|>"
     rows = [
         {
             "ordinal": 0,
             "reaction_id": "rxn0001",
-            "raw_response": (
-                "reasoning</think>\n\n<TS_EDGES>\na0 --[bo=1.5]-- a1\n</TS_EDGES><|im_end|>"
-            ),
+            "sample_count": THINKING_TEST_SAMPLE_COUNT,
+            "raw_responses": [correct, *(["unfinished reasoning"] * 9)],
         },
         {
             "ordinal": 1,
             "reaction_id": "rxn0002",
-            "raw_response": "unfinished reasoning",
+            "sample_count": THINKING_TEST_SAMPLE_COUNT,
+            "raw_responses": ["unfinished reasoning", correct, *(["unfinished reasoning"] * 8)],
         },
     ]
     (root / "predictions.jsonl").write_text(
@@ -64,7 +67,11 @@ def _raw_receipt(tmp_path: Path) -> ThinkingExplorationReceipt:
     )
     return ThinkingExplorationReceipt(
         path=root,
-        payload={"request_sha256": "a" * 64, "selection_count": 2},
+        payload={
+            "request_sha256": "a" * 64,
+            "selection_count": 2,
+            "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+        },
     )
 
 
@@ -76,7 +83,7 @@ def test_extract_thinking_answer_requires_one_closed_reasoning_block() -> None:
     assert extract_thinking_answer("a</think>b</think>c")[1] == "multiple_closing_think"
 
 
-def test_thinking_scores_use_only_final_answer_and_report_at_one(tmp_path: Path) -> None:
+def test_thinking_scores_use_only_final_answers_and_report_all_k(tmp_path: Path) -> None:
     config = _small_config()
     binding = ThinkingModelBinding(
         role="zero-shot",
@@ -96,11 +103,22 @@ def test_thinking_scores_use_only_final_answer_and_report_at_one(tmp_path: Path)
         (_record("rxn0001"), _record("rxn0002")),
     )
     metrics = json.loads((root / "metrics.json").read_text(encoding="utf-8"))
-    assert metrics["report_k"] == [1]
+    assert metrics["sample_count_per_reaction"] == THINKING_TEST_SAMPLE_COUNT
+    assert metrics["report_k"] == list(THINKING_TEST_REPORT_K)
+    assert set(metrics["evaluation"]["metrics"]) == {
+        "@1",
+        "@2",
+        "@3",
+        "@4",
+        "@5",
+        "@10",
+    }
     assert metrics["evaluation"]["metrics"]["@1"]["count"] == 2
     assert metrics["evaluation"]["metrics"]["@1"]["exact"]["successes"] == 1
-    assert metrics["extraction_errors"] == {"missing_closing_think": 1}
-    assert metrics["parse_valid_count"] == 1
+    assert metrics["evaluation"]["metrics"]["@2"]["exact"]["successes"] == 2
+    assert metrics["evaluation"]["metrics"]["@10"]["exact"]["successes"] == 2
+    assert metrics["extraction_errors"] == {"missing_closing_think": 18}
+    assert metrics["parse_valid_candidate_count"] == 2
 
 
 def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Path) -> None:
@@ -115,7 +133,7 @@ def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Pa
     )
     raw = _raw_receipt(tmp_path)
     raw_manifest = {
-        "schema_version": "janus-ts-thinking-exploration-v1",
+        "schema_version": "janus-ts-thinking-exploration-v2",
         "artifact_class": "exploratory-non-formal",
         "formal_eligible": False,
         "affects_checkpoint_selection": False,
@@ -123,6 +141,7 @@ def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Pa
         "writes_formal_test_lease": False,
         "writes_run_state": False,
         "world_size": 2,
+        "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
         "request_sha256": "a" * 64,
         "payload_inventory": {
             "rank-00000-of-00002.jsonl": {},
@@ -156,6 +175,8 @@ def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Pa
         "schema_version": THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
         "status": "complete",
         **binding.to_json_dict(),
+        "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+        "report_k": list(THINKING_TEST_REPORT_K),
         "request_sha256": "a" * 64,
         "raw_artifact_path": str(raw.path.resolve()),
         "raw_predictions_sha256": sha256_file(raw.path / "predictions.jsonl"),

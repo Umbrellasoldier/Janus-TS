@@ -123,7 +123,11 @@ class _ThinkingModel:
     def generate(self, *, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         self.kwargs = kwargs
         continuation = [*self.tokenizer.encode(self.response), QWEN_IM_END_TOKEN_ID]
-        return torch.tensor([[*input_ids[0].tolist(), *continuation]], dtype=torch.long)
+        sequence = [*input_ids[0].tolist(), *continuation]
+        return torch.tensor(
+            [sequence] * int(kwargs["num_return_sequences"]),
+            dtype=torch.long,
+        )
 
 
 def _checkpoint(tmp_path: Path) -> SimpleNamespace:
@@ -192,15 +196,21 @@ def test_sampled_generation_keeps_raw_thinking_response_and_exact_kwargs() -> No
         _record("rxn0007"),
         ordinal=7,
         profile=config.thinking_generation,
+        sample_count=10,
         max_input_length=100_000,
     )
 
     assert prediction.ordinal == 7
-    assert prediction.raw_response == ("reasoning\n</think>\n<TS_EDGES></TS_EDGES><|im_end|>")
+    assert (
+        prediction.raw_responses == ("reasoning\n</think>\n<TS_EDGES></TS_EDGES><|im_end|>",) * 10
+    )
     assert model.kwargs is not None
     attention_mask = model.kwargs.pop("attention_mask")
     assert torch.all(attention_mask == 1)
-    assert model.kwargs == thinking_generation_kwargs(config.thinking_generation)
+    assert model.kwargs == thinking_generation_kwargs(
+        config.thinking_generation,
+        sample_count=10,
+    )
 
 
 def test_selection_is_finite_by_default_and_odd_counts_get_one_dummy() -> None:
@@ -239,7 +249,7 @@ def test_exploration_manifest_is_content_verified_and_formally_ineligible(
             atom_count=record.atom_count,
             prompt_sha256=str(ordinal) * 64,
             prompt_tokens=100 + ordinal,
-            raw_response=f"response-{ordinal}",
+            raw_responses=(f"response-{ordinal}",),
         ).to_json_dict(
             split="val",
             rank=rank,
@@ -320,13 +330,14 @@ def test_full_runtime_is_cpu_injectable_and_reuses_formal_restore_chain(
     ) -> ThinkingPrediction:
         events.append(f"generate:{record.reaction_id}")
         assert kwargs["profile"] is config.thinking_generation
+        assert kwargs["sample_count"] == 1
         return ThinkingPrediction(
             reaction_id=record.reaction_id,
             ordinal=ordinal,
             atom_count=record.atom_count,
             prompt_sha256="e" * 64,
             prompt_tokens=111,
-            raw_response=f"thinking-{record.reaction_id}",
+            raw_responses=(f"thinking-{record.reaction_id}",),
         )
 
     def fake_barrier() -> None:
@@ -346,7 +357,8 @@ def test_full_runtime_is_cpu_injectable_and_reuses_formal_restore_chain(
                 "rank": 1,
                 "ordinal": 1,
                 "reaction_id": "rxn0002",
-                "raw_response": "thinking-rxn0002",
+                "sample_count": 1,
+                "raw_responses": ["thinking-rxn0002"],
             }
         )
         write_exploration_fragment(root, rank=1, rows=[rank_one])

@@ -2213,7 +2213,11 @@ def _validated_test_report(path: Path) -> Mapping[str, Any]:
 
 def _validated_thinking_report(path: Path) -> Mapping[str, Any]:
     from .generation import EXPECTED_FORMAL_SPLIT_COUNTS
-    from .thinking_evaluation import THINKING_EVALUATION_SCHEMA_VERSION
+    from .thinking_evaluation import (
+        THINKING_EVALUATION_SCHEMA_VERSION,
+        THINKING_TEST_REPORT_K,
+        THINKING_TEST_SAMPLE_COUNT,
+    )
 
     payload = _read_json(path)
     if (
@@ -2221,21 +2225,24 @@ def _validated_thinking_report(path: Path) -> Mapping[str, Any]:
         or payload.get("formal_eligible") is not False
         or payload.get("affects_checkpoint_selection") is not False
         or payload.get("split") != "test"
-        or payload.get("report_k") != [1]
+        or payload.get("sample_count_per_reaction") != THINKING_TEST_SAMPLE_COUNT
+        or payload.get("report_k") != list(THINKING_TEST_REPORT_K)
     ):
         raise WorkflowError(f"thinking metrics has the wrong protocol: {path}")
     evaluation = payload.get("evaluation")
     metrics = evaluation.get("metrics") if isinstance(evaluation, Mapping) else None
-    at_one = metrics.get("@1") if isinstance(metrics, Mapping) else None
+    expected_labels = {f"@{value}" for value in THINKING_TEST_REPORT_K}
     expected_count = EXPECTED_FORMAL_SPLIT_COUNTS["test"]
     if (
         not isinstance(evaluation, Mapping)
         or not isinstance(metrics, Mapping)
-        or set(metrics) != {"@1"}
-        or not isinstance(at_one, Mapping)
-        or at_one.get("count") != expected_count
+        or set(metrics) != expected_labels
     ):
-        raise WorkflowError(f"thinking @1 count is not {expected_count}: {path}")
+        raise WorkflowError(f"thinking evaluation has the wrong k values: {path}")
+    for label in expected_labels:
+        summary = metrics[label]
+        if not isinstance(summary, Mapping) or summary.get("count") != expected_count:
+            raise WorkflowError(f"thinking {label} count is not {expected_count}: {path}")
     return evaluation
 
 
@@ -2251,9 +2258,11 @@ def _write_inference_mode_comparison(
     zero_shot_thinking: Any,
     fine_tuned_thinking: Any,
 ) -> Path:
+    from .thinking_evaluation import THINKING_TEST_SAMPLE_COUNT
+
     output = prepared.paths.evaluations / "inference-mode-comparison.json"
     payload = {
-        "schema_version": "janus-ts-four-mode-comparison-v1",
+        "schema_version": "janus-ts-four-mode-comparison-v2",
         "data_fingerprint": prepared.run_identity.data_fingerprint,
         "run_fingerprint": prepared.run_identity.fingerprint,
         "test_count": 996,
@@ -2272,7 +2281,7 @@ def _write_inference_mode_comparison(
                 "evaluation": _validated_test_report(selected_metrics),
             },
             "thinking": {
-                "sample_count_per_reaction": 1,
+                "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
                 "metrics_sha256": sha256_file(fine_tuned_thinking.metrics_path),
                 "scored_predictions_sha256": sha256_file(fine_tuned_thinking.predictions_path),
                 "raw_artifact": str(fine_tuned_thinking.payload["raw_artifact_path"]),
@@ -2288,7 +2297,7 @@ def _write_inference_mode_comparison(
                 "evaluation": _validated_test_report(baseline_metrics),
             },
             "thinking": {
-                "sample_count_per_reaction": 1,
+                "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
                 "metrics_sha256": sha256_file(zero_shot_thinking.metrics_path),
                 "scored_predictions_sha256": sha256_file(zero_shot_thinking.predictions_path),
                 "raw_artifact": str(zero_shot_thinking.payload["raw_artifact_path"]),

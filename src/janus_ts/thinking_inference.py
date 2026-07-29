@@ -72,9 +72,9 @@ from .runtime import install_frozen_environment
 from .schema import ReactionRecord
 from .tokenization import EMPTY_THINK_PREFIX, CausalLMCollator
 
-THINKING_EXPLORATION_SCHEMA_VERSION = "janus-ts-thinking-exploration-v1"
-THINKING_PREDICTION_SCHEMA_VERSION = "janus-ts-thinking-prediction-v1"
-THINKING_REQUEST_SCHEMA_VERSION = "janus-ts-thinking-request-v1"
+THINKING_EXPLORATION_SCHEMA_VERSION = "janus-ts-thinking-exploration-v2"
+THINKING_PREDICTION_SCHEMA_VERSION = "janus-ts-thinking-prediction-v2"
+THINKING_REQUEST_SCHEMA_VERSION = "janus-ts-thinking-request-v2"
 ARTIFACT_CLASS = "exploratory-non-formal"
 THINKING_PROMPT_SUFFIX = "<think>\n"
 DEFAULT_EXPLORATION_LIMIT = 2
@@ -99,14 +99,22 @@ class ThinkingPromptEncoding:
 
 @dataclass(frozen=True, slots=True)
 class ThinkingPrediction:
-    """One raw sampled continuation; it is deliberately not parsed or scored."""
+    """Ordered raw sampled continuations; they are deliberately not scored here."""
 
     reaction_id: str
     ordinal: int
     atom_count: int
     prompt_sha256: str
     prompt_tokens: int
-    raw_response: str
+    raw_responses: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.raw_responses or any(
+            not isinstance(response, str) for response in self.raw_responses
+        ):
+            raise ThinkingInferenceError(
+                "thinking prediction requires one or more raw string responses"
+            )
 
     def to_json_dict(
         self,
@@ -130,7 +138,8 @@ class ThinkingPrediction:
             "atom_count": self.atom_count,
             "prompt_sha256": self.prompt_sha256,
             "prompt_tokens": self.prompt_tokens,
-            "raw_response": self.raw_response,
+            "sample_count": len(self.raw_responses),
+            "raw_responses": list(self.raw_responses),
         }
 
 
@@ -184,7 +193,11 @@ def validate_thinking_profile(profile: GenerationConfig) -> None:
         )
 
 
-def thinking_generation_kwargs(profile: GenerationConfig) -> dict[str, Any]:
+def thinking_generation_kwargs(
+    profile: GenerationConfig,
+    *,
+    sample_count: int | None = None,
+) -> dict[str, Any]:
     """Return only kwargs supported by Transformers' generation API.
 
     ``presence_penalty=0`` is retained in the artifact manifest for provenance,
@@ -193,9 +206,16 @@ def thinking_generation_kwargs(profile: GenerationConfig) -> dict[str, Any]:
     """
 
     validate_thinking_profile(profile)
+    effective_sample_count = profile.num_return_sequences if sample_count is None else sample_count
+    if (
+        isinstance(effective_sample_count, bool)
+        or not isinstance(effective_sample_count, int)
+        or effective_sample_count <= 0
+    ):
+        raise ThinkingInferenceError("thinking sample_count must be a positive integer")
     return {
         "num_beams": profile.num_beams,
-        "num_return_sequences": profile.num_return_sequences,
+        "num_return_sequences": effective_sample_count,
         "do_sample": profile.do_sample,
         "temperature": profile.temperature,
         "top_p": profile.top_p,
@@ -337,19 +357,22 @@ def generate_thinking_reaction(
     *,
     ordinal: int,
     profile: GenerationConfig,
+    sample_count: int | None = None,
     max_input_length: int = MAX_SEQUENCE_LENGTH,
 ) -> ThinkingPrediction:
-    """Sample one unparsed thinking response with synchronized ZeRO collectives."""
+    """Sample ordered unparsed thinking responses in one synchronized call."""
 
     import torch
 
     prompt = encode_thinking_prompt(tokenizer, record, max_length=max_input_length)
     input_ids = torch.tensor([prompt.input_ids], dtype=torch.long, device=_model_device(model))
     attention_mask = torch.ones_like(input_ids)
+    generation_kwargs = thinking_generation_kwargs(profile, sample_count=sample_count)
+    effective_sample_count = int(generation_kwargs["num_return_sequences"])
     output = model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        **thinking_generation_kwargs(profile),
+        **generation_kwargs,
     )
     sequences = getattr(output, "sequences", output)
     if not isinstance(sequences, torch.Tensor):
@@ -358,21 +381,24 @@ def generate_thinking_reaction(
         except (TypeError, ValueError) as exc:
             raise ThinkingInferenceError("model.generate did not return token sequences") from exc
     sequences = sequences.detach().cpu()
-    if sequences.ndim != 2 or sequences.shape[0] != 1:
+    if sequences.ndim != 2 or sequences.shape[0] != effective_sample_count:
         raise ThinkingInferenceError(
-            "thinking generate must return exactly one sequence, got "
+            f"thinking generate must return exactly {effective_sample_count} sequences, got "
             f"shape {tuple(sequences.shape)}"
         )
     prompt_length = len(prompt.input_ids)
     if sequences.shape[1] < prompt_length:
         raise ThinkingInferenceError("sampled sequence is shorter than its prompt")
     prefix = torch.tensor(prompt.input_ids, dtype=sequences.dtype)
-    if not torch.equal(sequences[0, :prompt_length], prefix):
+    prompt_prefixes = sequences[:, :prompt_length]
+    if not torch.equal(prompt_prefixes, prefix.expand_as(prompt_prefixes)):
         raise ThinkingInferenceError("thinking generation changed the decoder-only prompt")
-    continuation = _logical_continuation(sequences[0, prompt_length:].tolist())
+    continuations = [
+        _logical_continuation(sequence[prompt_length:].tolist()) for sequence in sequences
+    ]
     try:
         decoded = tokenizer.batch_decode(
-            [continuation],
+            continuations,
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
         )
@@ -380,15 +406,17 @@ def generate_thinking_reaction(
         raise ThinkingInferenceError(
             f"cannot decode thinking response for {record.reaction_id!r}: {exc}"
         ) from exc
-    if not isinstance(decoded, (list, tuple)) or len(decoded) != 1:
-        raise ThinkingInferenceError("tokenizer did not decode exactly one thinking response")
+    if not isinstance(decoded, (list, tuple)) or len(decoded) != effective_sample_count:
+        raise ThinkingInferenceError(
+            f"tokenizer did not decode exactly {effective_sample_count} thinking responses"
+        )
     return ThinkingPrediction(
         reaction_id=record.reaction_id,
         ordinal=ordinal,
         atom_count=record.atom_count,
         prompt_sha256=prompt.prompt_sha256,
         prompt_tokens=prompt_length,
-        raw_response=str(decoded[0]),
+        raw_responses=tuple(map(str, decoded)),
     )
 
 
@@ -493,8 +521,16 @@ def _request_payload(
     *,
     split: Split,
     records: Sequence[ReactionRecord],
+    sample_count_per_reaction: int | None = None,
 ) -> dict[str, Any]:
     scheduled = schedule_equal_rank_calls(records)
+    sample_count = (
+        config.thinking_generation.num_return_sequences
+        if sample_count_per_reaction is None
+        else sample_count_per_reaction
+    )
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
+        raise ThinkingInferenceError("thinking sample_count_per_reaction must be positive")
     return {
         "schema_version": THINKING_REQUEST_SCHEMA_VERSION,
         "artifact_class": ARTIFACT_CLASS,
@@ -506,8 +542,11 @@ def _request_payload(
         "split": split,
         "selected_reaction_ids": [record.reaction_id for record in records],
         "selection_count": len(records),
+        "sample_count_per_reaction": sample_count,
         "scheduled_generate_calls": len(scheduled),
         "dummy_generate_calls": len(scheduled) - len(records),
+        "scheduled_sample_count": len(scheduled) * sample_count,
+        "dummy_sample_count": (len(scheduled) - len(records)) * sample_count,
         "world_size": WORLD_SIZE,
         "seed": config.seed,
         "config_fingerprint": config.sha256,
@@ -524,6 +563,10 @@ def _request_payload(
             "empty_think_prefix_allowed": False,
         },
         "generation_profile": _profile_manifest(config.thinking_generation),
+        "generation_execution": {
+            "num_return_sequences": sample_count,
+            "candidates_batched_in_one_generate_call": True,
+        },
     }
 
 
@@ -631,6 +674,7 @@ def finalize_exploration_artifact(
     destination = Path(root)
     selected_ids = tuple(str(item) for item in request_payload["selected_reaction_ids"])
     checkpoint_fingerprint = str(request_payload["checkpoint_fingerprint"])
+    sample_count = int(request_payload["sample_count_per_reaction"])
     fragments = [exploration_fragment_path(destination, rank=rank) for rank in range(WORLD_SIZE)]
     rows: list[dict[str, Any]] = []
     for rank, fragment in enumerate(fragments):
@@ -643,8 +687,15 @@ def finalize_exploration_artifact(
                 "world_size": WORLD_SIZE,
                 "request_sha256": request_sha256,
                 "checkpoint_fingerprint": checkpoint_fingerprint,
+                "sample_count": sample_count,
             }
-            if any(row.get(name) != value for name, value in expected.items()):
+            raw_responses = row.get("raw_responses")
+            if (
+                any(row.get(name) != value for name, value in expected.items())
+                or not isinstance(raw_responses, list)
+                or len(raw_responses) != sample_count
+                or any(not isinstance(response, str) for response in raw_responses)
+            ):
                 raise ThinkingInferenceError(
                     f"rank {rank} exploratory fragment has stale or formal-eligible metadata"
                 )
@@ -693,6 +744,9 @@ def validate_exploration_artifact(
     }
     if any(manifest.get(name) != value for name, value in required.items()):
         raise ThinkingInferenceError("artifact is not an isolated non-formal thinking exploration")
+    sample_count = manifest.get("sample_count_per_reaction")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
+        raise ThinkingInferenceError("exploratory artifact has an invalid sample count")
     actual_request = manifest.get("request_sha256")
     if request_sha256 is not None and actual_request != request_sha256:
         raise ThinkingInferenceError("exploratory artifact request fingerprint mismatch")
@@ -733,6 +787,7 @@ def _rank_rows(
     split: Split,
     scheduled: Sequence[ScheduledRecord],
     request_sha256: str,
+    sample_count_per_reaction: int,
     generator: Callable[..., ThinkingPrediction],
 ) -> list[dict[str, Any]]:
     per_rank = len(scheduled) // WORLD_SIZE
@@ -746,8 +801,15 @@ def _rank_rows(
             item.record,
             ordinal=item.ordinal,
             profile=config.thinking_generation,
+            sample_count=sample_count_per_reaction,
             max_input_length=config.model.max_sequence_length,
         )
+        if len(prediction.raw_responses) != sample_count_per_reaction:
+            raise ThinkingInferenceError(
+                f"{item.record.reaction_id}: generator returned "
+                f"{len(prediction.raw_responses)} responses, expected "
+                f"{sample_count_per_reaction}"
+            )
         if not item.is_dummy:
             rows.append(
                 prediction.to_json_dict(
@@ -769,6 +831,7 @@ def run_thinking_inference(
     split: Split = "val",
     reaction_ids: Sequence[str] = (),
     limit: int | None = None,
+    sample_count_per_reaction: int | None = None,
     local_files_only: bool = True,
     environment_installer: Callable[[], Any] = install_frozen_environment,
     context_loader: Callable[[], TorchrunContext] = preflight_torchrun_environment,
@@ -798,7 +861,13 @@ def run_thinking_inference(
     checkpoint = checkpoint_inspector(checkpoint_dir, processed_path, config=config)
     records = record_loader(config, processed_path, split)
     selected = select_exploration_records(records, reaction_ids=reaction_ids, limit=limit)
-    request_payload = _request_payload(config, checkpoint, split=split, records=selected)
+    request_payload = _request_payload(
+        config,
+        checkpoint,
+        split=split,
+        records=selected,
+        sample_count_per_reaction=sample_count_per_reaction,
+    )
     run_root, request_sha256 = exploration_run_path(output_dir, request_payload)
     if (run_root / ".complete").is_file():
         return validate_exploration_artifact(run_root, request_sha256=request_sha256)
@@ -840,6 +909,7 @@ def run_thinking_inference(
         split=split,
         scheduled=scheduled,
         request_sha256=request_sha256,
+        sample_count_per_reaction=int(request_payload["sample_count_per_reaction"]),
         generator=generator,
     )
     write_exploration_fragment(run_root, rank=context.rank, rows=rows)

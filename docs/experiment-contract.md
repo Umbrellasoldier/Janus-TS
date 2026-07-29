@@ -205,10 +205,19 @@ The original pinned `Qwen/Qwen3.6-27B` is loaded directly in BF16 without
 PiSSA or LoRA. Both non-thinking modes use the identical `MoleCode-TS/v1`
 prompt, beam 10, 512-token limit, strict parser, and
 @1/@2/@3/@4/@5/@10 metrics. Both thinking modes use the separately frozen
-single-sample profile (`temperature=0.6`, `top_p=0.95`, `top_k=20`,
-`max_new_tokens=8192`). Their raw reasoning is retained; only the final answer
-after exactly one `</think>` marker is parsed and scored at @1. A missing,
-repeated, or unterminated thinking boundary is invalid.
+sampling profile (`beam=1`, `temperature=0.6`, `top_p=0.95`, `top_k=20`,
+`max_new_tokens=8192`). Complete-test evaluation requests ten independently
+sampled candidates per reaction in one generation call and reports
+@1/@2/@3/@4/@5/@10 with the same independent per-metric oracle rule as
+non-thinking. Every raw reasoning trace is retained; only the final answer
+after exactly one `</think>` marker is parsed. A missing, repeated, or
+unterminated thinking boundary makes that candidate invalid.
+
+The YAML value `thinking_generation.num_return_sequences=1` remains the base
+subset-exploration profile so the already-running training identity is
+unchanged. The complete-test request records an explicit
+`sample_count_per_reaction=10` override in its content-addressed manifest and
+forwards `num_return_sequences=10` to Transformers.
 
 Thinking artifacts are supplemental (`formal_eligible=false`), do not acquire
 the formal test lease, and cannot affect checkpoint selection. The final

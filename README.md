@@ -38,8 +38,9 @@ stress decode. After the @10 lexicographic winner is locked, the complete
 996-reaction test split runs in this order: raw-Qwen non-thinking, raw-Qwen
 thinking, selected-checkpoint non-thinking, selected-checkpoint thinking.
 Non-thinking uses deterministic beam 10 and reports @1/@2/@3/@4/@5/@10.
-Thinking uses the frozen single-sample profile, retains the raw reasoning,
-scores the answer after `</think>` at @1, and remains ineligible for checkpoint
+Each complete-test thinking call returns ten independently sampled candidates
+in one batch, retains every raw reasoning trace, and scores the answers after
+`</think>` at @1/@2/@3/@4/@5/@10. Thinking remains ineligible for checkpoint
 selection. The final artifact compares all four modes.
 Checkpoint and stage ordering use fingerprints, explicit global steps, and
 completion markers only—never filesystem modification time. Trainer events
@@ -75,8 +76,10 @@ written as a prediction.
 
 The frozen exploratory profile enables thinking and sampling with beam 1,
 temperature 0.6, top-p 0.95, top-k 20, min-p 0, repetition penalty 1, and up
-to 8192 new tokens. `presence_penalty=0` is recorded in provenance only and is
-not passed to Transformers. Results are content-addressed below
+to 8192 new tokens. The subset CLI retains its configured one-sample default;
+the automatic complete-test runner records and applies a ten-sample evaluation
+override without changing the training run identity. `presence_penalty=0` is
+recorded in provenance only and is not passed to Transformers. Results are content-addressed below
 `OUTPUT_DIR/thinking-exploratory/` and are marked `formal_eligible=false`.
 They do not compute formal metrics, alter checkpoint selection or run state,
 or acquire the one-time formal test lease.
