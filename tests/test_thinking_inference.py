@@ -17,11 +17,13 @@ from janus_ts.schema import Atom, Edge, MolecularState, ReactionRecord
 from janus_ts.thinking_inference import (
     ARTIFACT_CLASS,
     THINKING_EXPLORATION_SCHEMA_VERSION,
+    THINKING_TEST_BATCH_SIZE,
     ThinkingInferenceError,
     ThinkingPrediction,
     encode_thinking_prompt,
     finalize_exploration_artifact,
     generate_thinking_reaction,
+    generate_thinking_reactions,
     run_local_thinking_inference,
     run_thinking_inference,
     schedule_equal_rank_calls,
@@ -124,11 +126,11 @@ class _ThinkingModel:
     def generate(self, *, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         self.kwargs = kwargs
         continuation = [*self.tokenizer.encode(self.response), QWEN_IM_END_TOKEN_ID]
-        sequence = [*input_ids[0].tolist(), *continuation]
-        return torch.tensor(
-            [sequence] * int(kwargs["num_return_sequences"]),
-            dtype=torch.long,
-        )
+        sequences = []
+        for prompt_ids in input_ids:
+            sequence = [*prompt_ids.tolist(), *continuation]
+            sequences.extend([sequence] * int(kwargs["num_return_sequences"]))
+        return torch.tensor(sequences, dtype=torch.long)
 
 
 def _checkpoint(tmp_path: Path) -> SimpleNamespace:
@@ -214,6 +216,35 @@ def test_sampled_generation_keeps_raw_thinking_response_and_exact_kwargs() -> No
     )
 
 
+def test_two_reaction_thinking_batch_preserves_response_groups() -> None:
+    config = load_config("configs/transition1x.yaml")
+    tokenizer = _ThinkingTokenizer()
+    model = _ThinkingModel(tokenizer, "reasoning\n</think>\n<TS_EDGES></TS_EDGES>")
+    records = (_record("rxn0001"), _record("rxn0002"))
+
+    predictions = generate_thinking_reactions(
+        model,
+        tokenizer,
+        records,
+        ordinals=(2, 7),
+        profile=config.thinking_generation,
+        sample_count=10,
+        max_input_length=100_000,
+        synchronized=False,
+    )
+
+    assert THINKING_TEST_BATCH_SIZE == 2
+    assert [prediction.reaction_id for prediction in predictions] == [
+        "rxn0001",
+        "rxn0002",
+    ]
+    assert [prediction.ordinal for prediction in predictions] == [2, 7]
+    assert all(len(prediction.raw_responses) == 10 for prediction in predictions)
+    assert model.kwargs is not None
+    assert model.kwargs["attention_mask"].shape[0] == THINKING_TEST_BATCH_SIZE
+    assert model.kwargs["synced_gpus"] is False
+
+
 def test_selection_is_finite_by_default_and_odd_counts_get_one_dummy() -> None:
     records = tuple(_record(f"rxn{index:04d}") for index in range(1, 6))
 
@@ -283,6 +314,66 @@ def test_local_thinking_writes_both_logical_shards_without_synced_gpus(
     assert synchronized_values == [False, False, False, False]
     assert (receipt.path / "rank-00000-of-00002.jsonl").is_file()
     assert (receipt.path / "rank-00001-of-00002.jsonl").is_file()
+
+
+def test_local_thinking_uses_two_reaction_batches_only_for_test(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/transition1x.yaml")
+    checkpoint = _checkpoint(tmp_path)
+    records = tuple(_record(f"rxn{index:04d}", split="test") for index in range(3))
+    batch_sizes: list[int] = []
+
+    def batch_generator(
+        _model: Any,
+        _tokenizer: Any,
+        batch_records: tuple[ReactionRecord, ...],
+        *,
+        ordinals: tuple[int, ...],
+        synchronized: bool,
+        **_kwargs: Any,
+    ) -> tuple[ThinkingPrediction, ...]:
+        batch_sizes.append(len(batch_records))
+        assert synchronized is False
+        return tuple(
+            ThinkingPrediction(
+                reaction_id=record.reaction_id,
+                ordinal=ordinal,
+                atom_count=record.atom_count,
+                prompt_sha256="e" * 64,
+                prompt_tokens=10,
+                raw_responses=("response",),
+            )
+            for record, ordinal in zip(batch_records, ordinals, strict=True)
+        )
+
+    torch_module = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    receipt = run_local_thinking_inference(
+        config,
+        processed_path=tmp_path / "processed",
+        checkpoint_dir=checkpoint.path,
+        output_dir=tmp_path / "output",
+        split="test",
+        limit=3,
+        sample_count_per_reaction=1,
+        environment_installer=lambda: None,
+        reproducibility_configurer=lambda *_args, **_kwargs: None,
+        checkpoint_inspector=lambda *_args, **_kwargs: checkpoint,
+        record_loader=lambda *_args, **_kwargs: records,
+        model_loader=lambda *_args, **_kwargs: object(),
+        tokenizer_loader=lambda *_args, **_kwargs: object(),
+        generator=lambda *_args, **_kwargs: pytest.fail(
+            "test batches must not use the single-record generator"
+        ),
+        batch_generator=batch_generator,
+        torch_module=torch_module,
+        progress_interval=10,
+    )
+
+    assert batch_sizes == [2, 2]
+    assert receipt.payload["selection_count"] == 3
+    assert receipt.payload["scheduled_generate_calls"] == 2
+    assert receipt.payload["generation_execution"]["reaction_batch_size"] == 2
 
 
 def test_exploration_manifest_is_content_verified_and_formally_ineligible(

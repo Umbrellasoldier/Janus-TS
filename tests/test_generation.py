@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 import torch
 
+import janus_ts.generation as generation_module
 from janus_ts.constants import (
     QWEN_IM_END_TOKEN_ID,
     QWEN_IM_START_TOKEN_ID,
@@ -13,6 +14,7 @@ from janus_ts.constants import (
 )
 from janus_ts.generation import (
     FORMAL_NUM_BEAMS,
+    FORMAL_TEST_BATCH_SIZE,
     GenerationContractError,
     GenerationIdentity,
     GenerationRow,
@@ -24,6 +26,7 @@ from janus_ts.generation import (
     formal_generation_kwargs,
     fragment_path,
     generate_reaction,
+    generate_reactions,
     load_merged_predictions,
     load_selection_proof,
     merge_generation_fragments,
@@ -125,14 +128,15 @@ class FakeModel:
         ]
         longest = max(map(len, continuations))
         sequences = []
-        for continuation in continuations:
-            sequences.append(
-                [
-                    *input_ids[0].tolist(),
-                    *continuation,
-                    *([QWEN_PAD_TOKEN_ID] * (longest - len(continuation))),
-                ]
-            )
+        for prompt_ids in input_ids:
+            for continuation in continuations:
+                sequences.append(
+                    [
+                        *prompt_ids.tolist(),
+                        *continuation,
+                        *([QWEN_PAD_TOKEN_ID] * (longest - len(continuation))),
+                    ]
+                )
         return torch.tensor(sequences, dtype=torch.long)
 
 
@@ -217,6 +221,29 @@ def test_generation_kwargs_are_the_frozen_beam_profile() -> None:
     }
 
 
+def test_two_reaction_batch_preserves_order_and_all_beams() -> None:
+    tokenizer = FakeTokenizer()
+    target = serialize_target(reaction_record().ts_edges)
+    model = FakeModel(tokenizer, [target] * FORMAL_NUM_BEAMS)
+    reactions = (reaction_record("rxn0001"), reaction_record("rxn0002"))
+
+    rows = generate_reactions(
+        model,
+        tokenizer,
+        reactions,
+        ordinals=(3, 8),
+        synchronized=False,
+    )
+
+    assert FORMAL_TEST_BATCH_SIZE == 2
+    assert [row.reaction_id for row in rows] == ["rxn0001", "rxn0002"]
+    assert [row.ordinal for row in rows] == [3, 8]
+    assert all(len(row.raw_beams) == FORMAL_NUM_BEAMS for row in rows)
+    assert model.last_kwargs is not None
+    assert model.last_kwargs["attention_mask"].shape[0] == FORMAL_TEST_BATCH_SIZE
+    assert model.last_kwargs["synced_gpus"] is False
+
+
 def test_equal_contiguous_rank_halves_and_odd_count_rejection() -> None:
     assert rank_shard_bounds(994, rank=0) == (0, 497)
     assert rank_shard_bounds(994, rank=1) == (497, 994)
@@ -291,6 +318,54 @@ def test_local_generation_keeps_two_fragments_and_disables_synced_gpus(
     assert fragment_path(tmp_path, formal_identity, rank=1).is_file()
     assert model.last_kwargs is not None
     assert model.last_kwargs["synced_gpus"] is False
+
+
+def test_local_test_generation_uses_two_reaction_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(generation_module.EXPECTED_FORMAL_SPLIT_COUNTS, "test", 4)
+    test_identity = identity("test")
+    reactions = tuple(reaction_record(f"rxn{index:04d}", split="test") for index in range(4))
+    proof = SelectionProof(
+        data_fingerprint=test_identity.data_fingerprint,
+        run_fingerprint=test_identity.run_fingerprint,
+        selected_checkpoint_fingerprint=test_identity.checkpoint_fingerprint,
+        selected_epoch=5,
+        selected_global_step=500,
+    )
+    proof_path = write_selection_proof(tmp_path / "selection.json", proof)
+    batch_sizes: list[int] = []
+
+    def fake_generate(
+        _model: Any,
+        _tokenizer: Any,
+        records: tuple[ReactionRecord, ...],
+        *,
+        ordinals: tuple[int, ...],
+        synchronized: bool,
+    ) -> tuple[GenerationRow, ...]:
+        batch_sizes.append(len(records))
+        assert synchronized is False
+        return tuple(
+            prediction_row(record, ordinal)
+            for record, ordinal in zip(records, ordinals, strict=True)
+        )
+
+    monkeypatch.setattr(generation_module, "generate_reactions", fake_generate)
+    result = run_local_formal_generation(
+        object(),
+        object(),
+        reactions,
+        test_identity,
+        output_dir=tmp_path,
+        selection_proof_path=proof_path,
+        progress_interval=10,
+    )
+
+    assert batch_sizes == [2, 2]
+    assert result.eval_loss is None
+    assert result.predictions_path.is_file()
 
 
 def test_generation_rows_use_shared_strict_evaluator_and_aggregate() -> None:

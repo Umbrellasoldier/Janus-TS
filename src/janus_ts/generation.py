@@ -58,6 +58,7 @@ TEST_COMPLETION_SCHEMA_VERSION = "janus-ts-test-evaluation-complete-v1"
 EXPECTED_FORMAL_SPLIT_COUNTS = {"val": 994, "test": 996}
 FORMAL_WORLD_SIZE = 2
 FORMAL_NUM_BEAMS = 10
+FORMAL_TEST_BATCH_SIZE = 2
 FormalTestRole = Literal["selected_checkpoint", "frozen_zero_shot"]
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -321,10 +322,47 @@ def generate_reaction(
 ) -> GenerationRow:
     """Generate exactly ten ordered raw beams for one canonical input."""
 
-    prompt = encode_formal_prompt(tokenizer, record)
+    return generate_reactions(
+        model,
+        tokenizer,
+        (record,),
+        ordinals=(ordinal,),
+        synchronized=synchronized,
+    )[0]
+
+
+def generate_reactions(
+    model: Any,
+    tokenizer: Any,
+    records: Sequence[ReactionRecord | Mapping[str, Any]],
+    *,
+    ordinals: Sequence[int],
+    synchronized: bool = True,
+) -> tuple[GenerationRow, ...]:
+    """Generate ten ordered raw beams for each left-padded canonical input."""
+
+    if not records or len(records) != len(ordinals):
+        raise GenerationContractError(
+            "generation batch requires equally sized records and ordinals"
+        )
+    prompts = tuple(encode_formal_prompt(tokenizer, record) for record in records)
+    prompt_width = max(len(prompt.input_ids) for prompt in prompts)
     device = _model_device(model)
-    input_ids = torch.tensor([prompt.input_ids], dtype=torch.long, device=device)
-    attention_mask = torch.ones_like(input_ids)
+    input_ids = torch.full(
+        (len(prompts), prompt_width),
+        QWEN_PAD_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    for index, prompt in enumerate(prompts):
+        prompt_length = len(prompt.input_ids)
+        input_ids[index, -prompt_length:] = torch.tensor(
+            prompt.input_ids,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask[index, -prompt_length:] = 1
     outputs = model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -337,38 +375,49 @@ def generate_reaction(
         except (TypeError, ValueError) as exc:
             raise GenerationContractError("model.generate did not return token sequences") from exc
     sequences = sequences.detach().cpu()
-    if sequences.ndim != 2 or sequences.shape[0] != FORMAL_NUM_BEAMS:
+    expected_sequence_count = len(prompts) * FORMAL_NUM_BEAMS
+    if sequences.ndim != 2 or sequences.shape[0] != expected_sequence_count:
         raise GenerationContractError(
             "model.generate must return shape "
-            f"({FORMAL_NUM_BEAMS}, prompt+continuation), got {tuple(sequences.shape)}"
+            f"({expected_sequence_count}, prompt+continuation), got {tuple(sequences.shape)}"
         )
-    prompt_length = len(prompt.input_ids)
-    if sequences.shape[1] < prompt_length:
+    if sequences.shape[1] < prompt_width:
         raise GenerationContractError("generated sequence is shorter than its prompt")
-    expected_prefix = torch.tensor(prompt.input_ids, dtype=sequences.dtype)
-    prompt_prefixes = sequences[:, :prompt_length]
-    if not torch.equal(prompt_prefixes, expected_prefix.expand_as(prompt_prefixes)):
-        raise GenerationContractError("model.generate changed the decoder-only prompt prefix")
-    continuations = [_logical_continuation(row[prompt_length:].tolist()) for row in sequences]
-    try:
-        decoded = tokenizer.batch_decode(
-            continuations,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
+
+    rows: list[GenerationRow] = []
+    cpu_input_ids = input_ids.detach().cpu()
+    for batch_index, (prompt, ordinal) in enumerate(zip(prompts, ordinals, strict=True)):
+        start = batch_index * FORMAL_NUM_BEAMS
+        stop = start + FORMAL_NUM_BEAMS
+        prompt_prefixes = sequences[start:stop, :prompt_width]
+        expected_prefix = cpu_input_ids[batch_index].expand_as(prompt_prefixes)
+        if not torch.equal(prompt_prefixes, expected_prefix):
+            raise GenerationContractError("model.generate changed the decoder-only prompt prefix")
+        continuations = [
+            _logical_continuation(row[prompt_width:].tolist()) for row in sequences[start:stop]
+        ]
+        try:
+            decoded = tokenizer.batch_decode(
+                continuations,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except Exception as exc:
+            raise GenerationContractError(
+                f"cannot decode beams for {prompt.reaction_id!r}: {exc}"
+            ) from exc
+        if not isinstance(decoded, (list, tuple)) or len(decoded) != FORMAL_NUM_BEAMS:
+            raise GenerationContractError("tokenizer did not decode exactly ten beam strings")
+        rows.append(
+            GenerationRow(
+                reaction_id=prompt.reaction_id,
+                ordinal=ordinal,
+                atom_count=prompt.atom_count,
+                prompt_sha256=prompt.prompt_sha256,
+                raw_beams=tuple(decoded),
+            )
         )
-    except Exception as exc:
-        raise GenerationContractError(
-            f"cannot decode beams for {prompt.reaction_id!r}: {exc}"
-        ) from exc
-    if not isinstance(decoded, (list, tuple)) or len(decoded) != FORMAL_NUM_BEAMS:
-        raise GenerationContractError("tokenizer did not decode exactly ten beam strings")
-    return GenerationRow(
-        reaction_id=prompt.reaction_id,
-        ordinal=ordinal,
-        atom_count=prompt.atom_count,
-        prompt_sha256=prompt.prompt_sha256,
-        raw_beams=tuple(decoded),
-    )
+    return tuple(rows)
 
 
 def rank_shard_bounds(
@@ -1159,17 +1208,19 @@ def run_local_formal_generation(
     rows: list[GenerationRow] = []
     try:
         with _preserve_model_mode(model):
-            for ordinal, reaction in enumerate(reactions):
-                rows.append(
-                    generate_reaction(
+            batch_size = FORMAL_TEST_BATCH_SIZE if identity.split == "test" else 1
+            for start in range(0, len(reactions), batch_size):
+                stop = min(start + batch_size, len(reactions))
+                rows.extend(
+                    generate_reactions(
                         model,
                         tokenizer,
-                        reaction,
-                        ordinal=ordinal,
+                        reactions[start:stop],
+                        ordinals=tuple(range(start, stop)),
                         synchronized=False,
                     )
                 )
-                completed = ordinal + 1
+                completed = stop
                 if completed % progress_interval == 0 or completed == len(reactions):
                     print(
                         f"[generation:{identity.split}] {completed}/{len(reactions)}",
@@ -1237,6 +1288,7 @@ def run_local_formal_generation(
 __all__ = [
     "EXPECTED_FORMAL_SPLIT_COUNTS",
     "FORMAL_NUM_BEAMS",
+    "FORMAL_TEST_BATCH_SIZE",
     "FORMAL_WORLD_SIZE",
     "FormalTestRole",
     "GenerationContractError",
@@ -1253,6 +1305,7 @@ __all__ = [
     "formal_generation_kwargs",
     "fragment_path",
     "generate_reaction",
+    "generate_reactions",
     "load_merged_predictions",
     "load_selection_proof",
     "merge_generation_fragments",

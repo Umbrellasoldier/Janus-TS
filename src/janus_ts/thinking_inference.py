@@ -80,6 +80,7 @@ ARTIFACT_CLASS = "exploratory-non-formal"
 THINKING_PROMPT_SUFFIX = "<think>\n"
 DEFAULT_EXPLORATION_LIMIT = 2
 WORLD_SIZE = 2
+THINKING_TEST_BATCH_SIZE = 2
 Split = Literal["val", "test"]
 
 
@@ -365,11 +366,55 @@ def generate_thinking_reaction(
 ) -> ThinkingPrediction:
     """Sample ordered unparsed thinking responses in one synchronized call."""
 
+    return generate_thinking_reactions(
+        model,
+        tokenizer,
+        (record,),
+        ordinals=(ordinal,),
+        profile=profile,
+        sample_count=sample_count,
+        max_input_length=max_input_length,
+        synchronized=synchronized,
+    )[0]
+
+
+def generate_thinking_reactions(
+    model: Any,
+    tokenizer: Any,
+    records: Sequence[ReactionRecord],
+    *,
+    ordinals: Sequence[int],
+    profile: GenerationConfig,
+    sample_count: int | None = None,
+    max_input_length: int = MAX_SEQUENCE_LENGTH,
+    synchronized: bool = True,
+) -> tuple[ThinkingPrediction, ...]:
+    """Sample ordered responses for a left-padded batch of thinking prompts."""
+
     import torch
 
-    prompt = encode_thinking_prompt(tokenizer, record, max_length=max_input_length)
-    input_ids = torch.tensor([prompt.input_ids], dtype=torch.long, device=_model_device(model))
-    attention_mask = torch.ones_like(input_ids)
+    if not records or len(records) != len(ordinals):
+        raise ThinkingInferenceError("thinking batch requires equally sized records and ordinals")
+    prompts = tuple(
+        encode_thinking_prompt(tokenizer, record, max_length=max_input_length) for record in records
+    )
+    prompt_width = max(len(prompt.input_ids) for prompt in prompts)
+    device = _model_device(model)
+    input_ids = torch.full(
+        (len(prompts), prompt_width),
+        QWEN_PAD_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    for index, prompt in enumerate(prompts):
+        prompt_length = len(prompt.input_ids)
+        input_ids[index, -prompt_length:] = torch.tensor(
+            prompt.input_ids,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask[index, -prompt_length:] = 1
     generation_kwargs = thinking_generation_kwargs(
         profile,
         sample_count=sample_count,
@@ -388,43 +433,53 @@ def generate_thinking_reaction(
         except (TypeError, ValueError) as exc:
             raise ThinkingInferenceError("model.generate did not return token sequences") from exc
     sequences = sequences.detach().cpu()
-    if sequences.ndim != 2 or sequences.shape[0] != effective_sample_count:
+    expected_sequence_count = len(prompts) * effective_sample_count
+    if sequences.ndim != 2 or sequences.shape[0] != expected_sequence_count:
         raise ThinkingInferenceError(
-            f"thinking generate must return exactly {effective_sample_count} sequences, got "
+            f"thinking generate must return exactly {expected_sequence_count} sequences, got "
             f"shape {tuple(sequences.shape)}"
         )
-    prompt_length = len(prompt.input_ids)
-    if sequences.shape[1] < prompt_length:
+    if sequences.shape[1] < prompt_width:
         raise ThinkingInferenceError("sampled sequence is shorter than its prompt")
-    prefix = torch.tensor(prompt.input_ids, dtype=sequences.dtype)
-    prompt_prefixes = sequences[:, :prompt_length]
-    if not torch.equal(prompt_prefixes, prefix.expand_as(prompt_prefixes)):
-        raise ThinkingInferenceError("thinking generation changed the decoder-only prompt")
-    continuations = [
-        _logical_continuation(sequence[prompt_length:].tolist()) for sequence in sequences
-    ]
-    try:
-        decoded = tokenizer.batch_decode(
-            continuations,
-            skip_special_tokens=False,
-            clean_up_tokenization_spaces=False,
+
+    predictions: list[ThinkingPrediction] = []
+    cpu_input_ids = input_ids.detach().cpu()
+    for batch_index, (prompt, ordinal) in enumerate(zip(prompts, ordinals, strict=True)):
+        start = batch_index * effective_sample_count
+        stop = start + effective_sample_count
+        prompt_prefixes = sequences[start:stop, :prompt_width]
+        expected_prefix = cpu_input_ids[batch_index].expand_as(prompt_prefixes)
+        if not torch.equal(prompt_prefixes, expected_prefix):
+            raise ThinkingInferenceError("thinking generation changed the decoder-only prompt")
+        continuations = [
+            _logical_continuation(sequence[prompt_width:].tolist())
+            for sequence in sequences[start:stop]
+        ]
+        try:
+            decoded = tokenizer.batch_decode(
+                continuations,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except Exception as exc:
+            raise ThinkingInferenceError(
+                f"cannot decode thinking response for {prompt.reaction_id!r}: {exc}"
+            ) from exc
+        if not isinstance(decoded, (list, tuple)) or len(decoded) != effective_sample_count:
+            raise ThinkingInferenceError(
+                f"tokenizer did not decode exactly {effective_sample_count} thinking responses"
+            )
+        predictions.append(
+            ThinkingPrediction(
+                reaction_id=prompt.reaction_id,
+                ordinal=ordinal,
+                atom_count=prompt.atom_count,
+                prompt_sha256=prompt.prompt_sha256,
+                prompt_tokens=len(prompt.input_ids),
+                raw_responses=tuple(map(str, decoded)),
+            )
         )
-    except Exception as exc:
-        raise ThinkingInferenceError(
-            f"cannot decode thinking response for {record.reaction_id!r}: {exc}"
-        ) from exc
-    if not isinstance(decoded, (list, tuple)) or len(decoded) != effective_sample_count:
-        raise ThinkingInferenceError(
-            f"tokenizer did not decode exactly {effective_sample_count} thinking responses"
-        )
-    return ThinkingPrediction(
-        reaction_id=record.reaction_id,
-        ordinal=ordinal,
-        atom_count=record.atom_count,
-        prompt_sha256=prompt.prompt_sha256,
-        prompt_tokens=prompt_length,
-        raw_responses=tuple(map(str, decoded)),
-    )
+    return tuple(predictions)
 
 
 def load_exploration_records(
@@ -529,6 +584,7 @@ def _request_payload(
     split: Split,
     records: Sequence[ReactionRecord],
     sample_count_per_reaction: int | None = None,
+    reaction_batch_size: int = 1,
 ) -> dict[str, Any]:
     scheduled = schedule_equal_rank_calls(records)
     sample_count = (
@@ -538,6 +594,14 @@ def _request_payload(
     )
     if isinstance(sample_count, bool) or not isinstance(sample_count, int) or sample_count <= 0:
         raise ThinkingInferenceError("thinking sample_count_per_reaction must be positive")
+    if (
+        isinstance(reaction_batch_size, bool)
+        or not isinstance(reaction_batch_size, int)
+        or reaction_batch_size <= 0
+    ):
+        raise ThinkingInferenceError("thinking reaction_batch_size must be positive")
+    per_rank = len(scheduled) // WORLD_SIZE
+    calls_per_rank = (per_rank + reaction_batch_size - 1) // reaction_batch_size
     return {
         "schema_version": THINKING_REQUEST_SCHEMA_VERSION,
         "artifact_class": ARTIFACT_CLASS,
@@ -550,7 +614,7 @@ def _request_payload(
         "selected_reaction_ids": [record.reaction_id for record in records],
         "selection_count": len(records),
         "sample_count_per_reaction": sample_count,
-        "scheduled_generate_calls": len(scheduled),
+        "scheduled_generate_calls": calls_per_rank * WORLD_SIZE,
         "dummy_generate_calls": len(scheduled) - len(records),
         "scheduled_sample_count": len(scheduled) * sample_count,
         "dummy_sample_count": (len(scheduled) - len(records)) * sample_count,
@@ -573,6 +637,7 @@ def _request_payload(
         "generation_execution": {
             "num_return_sequences": sample_count,
             "candidates_batched_in_one_generate_call": True,
+            "reaction_batch_size": reaction_batch_size,
         },
     }
 
@@ -953,6 +1018,7 @@ def run_local_thinking_inference(
     model_loader: Callable[..., Any] = load_device_map_portable_model,
     tokenizer_loader: Callable[..., Any] = load_pinned_tokenizer,
     generator: Callable[..., ThinkingPrediction] = generate_thinking_reaction,
+    batch_generator: Callable[..., tuple[ThinkingPrediction, ...]] = (generate_thinking_reactions),
     torch_module: Any | None = None,
     progress_interval: int = 1,
 ) -> ThinkingExplorationReceipt:
@@ -965,12 +1031,14 @@ def run_local_thinking_inference(
     checkpoint = checkpoint_inspector(checkpoint_dir, processed_path, config=config)
     records = record_loader(config, processed_path, split)
     selected = select_exploration_records(records, reaction_ids=reaction_ids, limit=limit)
+    reaction_batch_size = THINKING_TEST_BATCH_SIZE if split == "test" else 1
     request_payload = _request_payload(
         config,
         checkpoint,
         split=split,
         records=selected,
         sample_count_per_reaction=sample_count_per_reaction,
+        reaction_batch_size=reaction_batch_size,
     )
     request_payload["runtime_execution"] = "single-process-two-gpu-device-map"
     execution = dict(request_payload["generation_execution"])
@@ -995,7 +1063,7 @@ def run_local_thinking_inference(
 
     scheduled = schedule_equal_rank_calls(selected)
     per_rank = len(scheduled) // WORLD_SIZE
-    completed_calls = 0
+    completed_records = 0
     sample_count = int(request_payload["sample_count_per_reaction"])
     for logical_rank in range(WORLD_SIZE):
         reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
@@ -1004,35 +1072,56 @@ def run_local_thinking_inference(
         rows: list[dict[str, Any]] = []
         start = logical_rank * per_rank
         stop = start + per_rank
-        for item in scheduled[start:stop]:
-            prediction = generator(
-                model,
-                tokenizer,
-                item.record,
-                ordinal=item.ordinal,
-                profile=config.thinking_generation,
-                sample_count=sample_count,
-                max_input_length=config.model.max_sequence_length,
-                synchronized=False,
-            )
-            if len(prediction.raw_responses) != sample_count:
+        rank_items = scheduled[start:stop]
+        for batch_start in range(0, len(rank_items), reaction_batch_size):
+            items = rank_items[batch_start : batch_start + reaction_batch_size]
+            if len(items) == 1:
+                predictions = (
+                    generator(
+                        model,
+                        tokenizer,
+                        items[0].record,
+                        ordinal=items[0].ordinal,
+                        profile=config.thinking_generation,
+                        sample_count=sample_count,
+                        max_input_length=config.model.max_sequence_length,
+                        synchronized=False,
+                    ),
+                )
+            else:
+                predictions = batch_generator(
+                    model,
+                    tokenizer,
+                    tuple(item.record for item in items),
+                    ordinals=tuple(item.ordinal for item in items),
+                    profile=config.thinking_generation,
+                    sample_count=sample_count,
+                    max_input_length=config.model.max_sequence_length,
+                    synchronized=False,
+                )
+            if len(predictions) != len(items):
                 raise ThinkingInferenceError(
-                    f"{item.record.reaction_id}: generator returned "
-                    f"{len(prediction.raw_responses)} responses, expected {sample_count}"
+                    "thinking batch generator returned the wrong number of predictions"
                 )
-            if not item.is_dummy:
-                rows.append(
-                    prediction.to_json_dict(
-                        split=split,
-                        rank=logical_rank,
-                        request_sha256=request_sha256,
-                        checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+            for item, prediction in zip(items, predictions, strict=True):
+                if len(prediction.raw_responses) != sample_count:
+                    raise ThinkingInferenceError(
+                        f"{item.record.reaction_id}: generator returned "
+                        f"{len(prediction.raw_responses)} responses, expected {sample_count}"
                     )
-                )
-            completed_calls += 1
-            if completed_calls % progress_interval == 0 or completed_calls == len(scheduled):
+                if not item.is_dummy:
+                    rows.append(
+                        prediction.to_json_dict(
+                            split=split,
+                            rank=logical_rank,
+                            request_sha256=request_sha256,
+                            checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+                        )
+                    )
+            completed_records += len(items)
+            if completed_records % progress_interval == 0 or completed_records == len(scheduled):
                 print(
-                    f"[thinking:{split}] {completed_calls}/{len(scheduled)}",
+                    f"[thinking:{split}] {completed_records}/{len(scheduled)}",
                     flush=True,
                 )
         write_exploration_fragment(run_root, rank=logical_rank, rows=rows)
@@ -1093,6 +1182,7 @@ __all__ = [
     "DEFAULT_EXPLORATION_LIMIT",
     "THINKING_EXPLORATION_SCHEMA_VERSION",
     "THINKING_PREDICTION_SCHEMA_VERSION",
+    "THINKING_TEST_BATCH_SIZE",
     "ThinkingExplorationReceipt",
     "ThinkingInferenceError",
     "ThinkingPrediction",
@@ -1101,6 +1191,7 @@ __all__ = [
     "exploration_run_path",
     "finalize_exploration_artifact",
     "generate_thinking_reaction",
+    "generate_thinking_reactions",
     "load_exploration_records",
     "render_thinking_prompt",
     "run_local_thinking_inference",
