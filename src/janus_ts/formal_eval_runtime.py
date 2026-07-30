@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -39,6 +38,10 @@ from .constants import (
     QWEN_IM_END_TOKEN_ID,
     QWEN_PAD_TOKEN_ID,
 )
+from .device_map_runtime import (
+    compute_global_target_token_eval_loss,
+    load_device_map_portable_model,
+)
 from .distributed import (
     TorchrunContext,
     assert_initialized_two_rank_job,
@@ -58,6 +61,7 @@ from .generation import (
     merged_predictions_path,
     metrics_path,
     run_formal_generation,
+    run_local_formal_generation,
     trainer_eval_loss_hook,
 )
 from .metrics import AggregateMetrics
@@ -325,9 +329,7 @@ def inspect_durable_checkpoint(
         raise FormalEvalRuntimeError("unsupported durable checkpoint schema")
     kind = manifest.get("kind")
     if kind not in {"epoch", "train-loss"}:
-        raise FormalEvalRuntimeError(
-            "formal evaluation requires an epoch or train-loss checkpoint"
-        )
+        raise FormalEvalRuntimeError("formal evaluation requires an epoch or train-loss checkpoint")
     raw_epoch = manifest.get("epoch")
     try:
         epoch_float = float(raw_epoch)
@@ -1036,14 +1038,11 @@ def run_formal_checkpoint_evaluation(
             selection_proof_path,
             checkpoint.generation_identity("test"),
         )
-        if (
-            proof.selected_global_step != checkpoint.global_step
-            or not math.isclose(
-                float(proof.selected_epoch),
-                checkpoint.epoch,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
+        if proof.selected_global_step != checkpoint.global_step or not math.isclose(
+            float(proof.selected_epoch),
+            checkpoint.epoch,
+            rel_tol=0.0,
+            abs_tol=1e-12,
         ):
             raise FormalEvalRuntimeError(
                 "selection proof training position differs from selected checkpoint"
@@ -1108,6 +1107,97 @@ def run_formal_checkpoint_evaluation(
     )
 
 
+def run_local_formal_checkpoint_evaluation(
+    config: ExperimentConfig,
+    *,
+    processed_path: str | Path,
+    checkpoint_dir: str | Path,
+    output_dir: str | Path,
+    split: Split,
+    selection_proof_path: str | Path | None = None,
+    local_files_only: bool = True,
+    environment_installer: Callable[[], Any] = install_frozen_environment,
+    reproducibility_configurer: Callable[..., None] = configure_reproducibility,
+    model_loader: Callable[..., Any] = load_device_map_portable_model,
+    tokenizer_loader: Callable[..., Any] = load_pinned_tokenizer,
+    data_preparer: Callable[..., PreparedFormalData] = prepare_formal_data,
+    loss_evaluator: Callable[..., float] = compute_global_target_token_eval_loss,
+    generation_runner: Callable[..., FormalEvaluationResult] = run_local_formal_generation,
+    torch_module: Any | None = None,
+) -> FormalRuntimeReceipt:
+    """Evaluate one checkpoint with one BF16 model dispatched across both GPUs."""
+
+    if split not in ("val", "test"):
+        raise FormalEvalRuntimeError(f"formal split must be val or test, got {split!r}")
+    if split == "val" and selection_proof_path is not None:
+        raise FormalEvalRuntimeError("validation must not receive a selection proof")
+    if split == "test" and selection_proof_path is None:
+        raise FormalEvalRuntimeError("test requires a locked selection proof")
+    environment_installer()
+    checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed_path, config=config)
+    output_root = Path(output_dir)
+    if split == "test":
+        proof = load_selection_proof(
+            selection_proof_path,
+            checkpoint.generation_identity("test"),
+        )
+        if proof.selected_global_step != checkpoint.global_step or not math.isclose(
+            float(proof.selected_epoch),
+            checkpoint.epoch,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise FormalEvalRuntimeError(
+                "selection proof training position differs from selected checkpoint"
+            )
+        recovered = recover_completed_test(output_root, checkpoint)
+        if recovered is not None:
+            return recovered
+
+    if torch_module is None:
+        import torch as torch_module
+    reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
+    model = model_loader(
+        config,
+        checkpoint,
+        local_files_only=local_files_only,
+    )
+    tokenizer = tokenizer_loader(config, local_files_only=local_files_only)
+    prepared = data_preparer(config, processed_path, tokenizer, split)
+    if split == "val":
+        if prepared.eval_dataset is None:
+            raise FormalEvalRuntimeError("validation has no causal-loss dataset")
+        eval_loss = loss_evaluator(
+            model,
+            prepared.eval_dataset,
+            prepared.collator,
+        )
+    else:
+        eval_loss = None
+    result = generation_runner(
+        model,
+        tokenizer,
+        prepared.records,
+        checkpoint.generation_identity(split),
+        output_dir=output_root,
+        eval_loss=eval_loss,
+        selection_proof_path=selection_proof_path,
+    )
+    if result.eval_loss != eval_loss:
+        raise FormalEvalRuntimeError("formal generation changed eval_loss")
+    metrics_payload = _load_metrics_payload(result.metrics_path, checkpoint, split)
+    if sha256_file(result.predictions_path) != metrics_payload["predictions_sha256"]:
+        raise FormalEvalRuntimeError("generated predictions differ from the metrics receipt")
+    return _install_or_validate_receipt(
+        output_root,
+        checkpoint,
+        split,
+        predictions=result.predictions_path,
+        metrics=result.metrics_path,
+        eval_loss=eval_loss,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("split", choices=("val", "test"))
@@ -1122,7 +1212,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     config = load_config(arguments.config)
-    receipt = run_formal_checkpoint_evaluation(
+    receipt = run_local_formal_checkpoint_evaluation(
         config,
         processed_path=arguments.processed_path,
         checkpoint_dir=arguments.checkpoint_dir,
@@ -1131,8 +1221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         selection_proof_path=arguments.selection_proof,
         local_files_only=True,
     )
-    if receipt is not None and int(os.environ.get("RANK", "0")) == 0:
-        print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
+    print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
     return 0
 
 
@@ -1157,6 +1246,7 @@ __all__ = [
     "prepare_formal_data",
     "recover_completed_test",
     "run_formal_checkpoint_evaluation",
+    "run_local_formal_checkpoint_evaluation",
     "runtime_receipt_path",
     "validate_runtime_receipt",
 ]

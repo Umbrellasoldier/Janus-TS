@@ -45,6 +45,7 @@ from .constants import (
     QWEN_PAD_TOKEN_ID,
     SYSTEM_PROMPT,
 )
+from .device_map_runtime import load_device_map_portable_model
 from .distributed import (
     TorchrunContext,
     assert_initialized_two_rank_job,
@@ -197,6 +198,7 @@ def thinking_generation_kwargs(
     profile: GenerationConfig,
     *,
     sample_count: int | None = None,
+    synchronized: bool = True,
 ) -> dict[str, Any]:
     """Return only kwargs supported by Transformers' generation API.
 
@@ -226,7 +228,7 @@ def thinking_generation_kwargs(
         "eos_token_id": QWEN_IM_END_TOKEN_ID,
         "pad_token_id": QWEN_PAD_TOKEN_ID,
         "use_cache": True,
-        "synced_gpus": True,
+        "synced_gpus": bool(synchronized),
     }
 
 
@@ -359,6 +361,7 @@ def generate_thinking_reaction(
     profile: GenerationConfig,
     sample_count: int | None = None,
     max_input_length: int = MAX_SEQUENCE_LENGTH,
+    synchronized: bool = True,
 ) -> ThinkingPrediction:
     """Sample ordered unparsed thinking responses in one synchronized call."""
 
@@ -367,7 +370,11 @@ def generate_thinking_reaction(
     prompt = encode_thinking_prompt(tokenizer, record, max_length=max_input_length)
     input_ids = torch.tensor([prompt.input_ids], dtype=torch.long, device=_model_device(model))
     attention_mask = torch.ones_like(input_ids)
-    generation_kwargs = thinking_generation_kwargs(profile, sample_count=sample_count)
+    generation_kwargs = thinking_generation_kwargs(
+        profile,
+        sample_count=sample_count,
+        synchronized=synchronized,
+    )
     effective_sample_count = int(generation_kwargs["num_return_sequences"])
     output = model.generate(
         input_ids=input_ids,
@@ -928,6 +935,114 @@ def run_thinking_inference(
     return validate_exploration_artifact(run_root, request_sha256=request_sha256)
 
 
+def run_local_thinking_inference(
+    config: ExperimentConfig,
+    *,
+    processed_path: str | Path,
+    checkpoint_dir: str | Path,
+    output_dir: str | Path,
+    split: Split = "val",
+    reaction_ids: Sequence[str] = (),
+    limit: int | None = None,
+    sample_count_per_reaction: int | None = None,
+    local_files_only: bool = True,
+    environment_installer: Callable[[], Any] = install_frozen_environment,
+    reproducibility_configurer: Callable[..., None] = configure_reproducibility,
+    checkpoint_inspector: Callable[..., DurableCheckpoint] = inspect_durable_checkpoint,
+    record_loader: Callable[..., tuple[ReactionRecord, ...]] = load_exploration_records,
+    model_loader: Callable[..., Any] = load_device_map_portable_model,
+    tokenizer_loader: Callable[..., Any] = load_pinned_tokenizer,
+    generator: Callable[..., ThinkingPrediction] = generate_thinking_reaction,
+    torch_module: Any | None = None,
+    progress_interval: int = 1,
+) -> ThinkingExplorationReceipt:
+    """Run both logical output shards through one model dispatched across two GPUs."""
+
+    if split not in ("val", "test"):
+        raise ThinkingInferenceError(f"thinking split must be val or test, got {split!r}")
+    validate_thinking_profile(config.thinking_generation)
+    environment_installer()
+    checkpoint = checkpoint_inspector(checkpoint_dir, processed_path, config=config)
+    records = record_loader(config, processed_path, split)
+    selected = select_exploration_records(records, reaction_ids=reaction_ids, limit=limit)
+    request_payload = _request_payload(
+        config,
+        checkpoint,
+        split=split,
+        records=selected,
+        sample_count_per_reaction=sample_count_per_reaction,
+    )
+    request_payload["runtime_execution"] = "single-process-two-gpu-device-map"
+    execution = dict(request_payload["generation_execution"])
+    execution["synced_gpus"] = False
+    request_payload["generation_execution"] = execution
+    run_root, request_sha256 = exploration_run_path(output_dir, request_payload)
+    if (run_root / ".complete").is_file():
+        return validate_exploration_artifact(run_root, request_sha256=request_sha256)
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    if torch_module is None:
+        import torch as torch_module
+    reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
+    if torch_module.cuda.is_available():
+        torch_module.cuda.manual_seed_all(config.seed)
+    model = model_loader(
+        config,
+        checkpoint,
+        local_files_only=local_files_only,
+    )
+    tokenizer = tokenizer_loader(config, local_files_only=local_files_only)
+
+    scheduled = schedule_equal_rank_calls(selected)
+    per_rank = len(scheduled) // WORLD_SIZE
+    completed_calls = 0
+    sample_count = int(request_payload["sample_count_per_reaction"])
+    for logical_rank in range(WORLD_SIZE):
+        reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
+        if torch_module.cuda.is_available():
+            torch_module.cuda.manual_seed_all(config.seed)
+        rows: list[dict[str, Any]] = []
+        start = logical_rank * per_rank
+        stop = start + per_rank
+        for item in scheduled[start:stop]:
+            prediction = generator(
+                model,
+                tokenizer,
+                item.record,
+                ordinal=item.ordinal,
+                profile=config.thinking_generation,
+                sample_count=sample_count,
+                max_input_length=config.model.max_sequence_length,
+                synchronized=False,
+            )
+            if len(prediction.raw_responses) != sample_count:
+                raise ThinkingInferenceError(
+                    f"{item.record.reaction_id}: generator returned "
+                    f"{len(prediction.raw_responses)} responses, expected {sample_count}"
+                )
+            if not item.is_dummy:
+                rows.append(
+                    prediction.to_json_dict(
+                        split=split,
+                        rank=logical_rank,
+                        request_sha256=request_sha256,
+                        checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+                    )
+                )
+            completed_calls += 1
+            if completed_calls % progress_interval == 0 or completed_calls == len(scheduled):
+                print(
+                    f"[thinking:{split}] {completed_calls}/{len(scheduled)}",
+                    flush=True,
+                )
+        write_exploration_fragment(run_root, rank=logical_rank, rows=rows)
+    return finalize_exploration_artifact(
+        run_root,
+        request_payload,
+        request_sha256=request_sha256,
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -988,6 +1103,7 @@ __all__ = [
     "generate_thinking_reaction",
     "load_exploration_records",
     "render_thinking_prompt",
+    "run_local_thinking_inference",
     "run_thinking_inference",
     "schedule_equal_rank_calls",
     "select_exploration_records",

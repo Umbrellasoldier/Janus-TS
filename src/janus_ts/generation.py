@@ -1096,6 +1096,144 @@ def run_formal_generation(
         raise
 
 
+def run_local_formal_generation(
+    model: Any,
+    tokenizer: Any,
+    records: Sequence[ReactionRecord | Mapping[str, Any]],
+    identity: GenerationIdentity,
+    *,
+    output_dir: str | Path,
+    eval_loss: EvalLossSource | None = None,
+    selection_proof_path: str | Path | None = None,
+    test_role: FormalTestRole = "selected_checkpoint",
+    progress_interval: int = 10,
+) -> FormalEvaluationResult:
+    """Generate on one two-GPU device-map model and retain the two-fragment schema."""
+
+    reactions = _validate_formal_records(records, identity)
+    _, midpoint = rank_shard_bounds(
+        len(reactions),
+        rank=0,
+        world_size=FORMAL_WORLD_SIZE,
+    )
+    _, stop = rank_shard_bounds(
+        len(reactions),
+        rank=1,
+        world_size=FORMAL_WORLD_SIZE,
+    )
+    if test_role not in ("selected_checkpoint", "frozen_zero_shot"):
+        raise GenerationContractError(f"invalid formal test role: {test_role!r}")
+    if identity.split == "val":
+        if test_role != "selected_checkpoint":
+            raise GenerationContractError("validation cannot use a test-only model role")
+        if eval_loss is None:
+            raise GenerationContractError("formal validation requires eval_loss")
+        resolved_eval_loss = resolve_eval_loss(eval_loss)
+        proof = None
+    else:
+        if eval_loss is not None:
+            raise GenerationContractError("test evaluation must not compute checkpoint eval_loss")
+        if test_role == "selected_checkpoint":
+            if selection_proof_path is None:
+                raise GenerationContractError(
+                    "selected-checkpoint test evaluation requires the locked selection proof"
+                )
+            proof = load_selection_proof(selection_proof_path, identity)
+        else:
+            if selection_proof_path is not None:
+                raise GenerationContractError(
+                    "frozen zero-shot test evaluation must not receive a selection proof"
+                )
+            proof = None
+        resolved_eval_loss = None
+
+    lease: TestEvaluationLease | None = None
+    if identity.split == "test":
+        lease = TestEvaluationLease(output_dir, identity)
+        if lease.completion_path.exists():
+            raise TestAlreadyEvaluatedError(
+                f"selected checkpoint test evaluation is already complete: {lease.completion_path}"
+            )
+        lease.acquire()
+
+    rows: list[GenerationRow] = []
+    try:
+        with _preserve_model_mode(model):
+            for ordinal, reaction in enumerate(reactions):
+                rows.append(
+                    generate_reaction(
+                        model,
+                        tokenizer,
+                        reaction,
+                        ordinal=ordinal,
+                        synchronized=False,
+                    )
+                )
+                completed = ordinal + 1
+                if completed % progress_interval == 0 or completed == len(reactions):
+                    print(
+                        f"[generation:{identity.split}] {completed}/{len(reactions)}",
+                        flush=True,
+                    )
+        write_generation_fragment(
+            output_dir,
+            identity,
+            rank=0,
+            rows=rows[:midpoint],
+            world_size=FORMAL_WORLD_SIZE,
+        )
+        write_generation_fragment(
+            output_dir,
+            identity,
+            rank=1,
+            rows=rows[midpoint:stop],
+            world_size=FORMAL_WORLD_SIZE,
+        )
+        expected_ids = tuple(reaction.reaction_id for reaction in reactions)
+        predictions, merged_rows = merge_generation_fragments(
+            output_dir,
+            identity,
+            expected_reaction_ids=expected_ids,
+            world_size=FORMAL_WORLD_SIZE,
+        )
+        reloaded = load_merged_predictions(
+            predictions,
+            identity,
+            expected_reaction_ids=expected_ids,
+            world_size=FORMAL_WORLD_SIZE,
+        )
+        if reloaded != merged_rows:
+            raise GenerationContractError("merged prediction round-trip changed content")
+        evaluations, report = evaluate_generation_rows(reactions, merged_rows)
+        metrics_destination = metrics_path(output_dir, identity)
+        _write_evaluation_metrics(
+            metrics_destination,
+            identity,
+            predictions_path=predictions,
+            report=report,
+            eval_loss=resolved_eval_loss,
+        )
+        result = FormalEvaluationResult(
+            predictions_path=predictions,
+            metrics_path=metrics_destination,
+            evaluations=evaluations,
+            report=report,
+            eval_loss=resolved_eval_loss,
+        )
+        if lease is not None:
+            if test_role == "selected_checkpoint" and proof is None:
+                raise GenerationContractError("test selection proof was not retained")
+            lease.complete(
+                predictions_path=predictions,
+                metrics_path_value=metrics_destination,
+            )
+        return result
+    except BaseException:
+        if lease is not None:
+            lease.release()
+        raise
+
+
 __all__ = [
     "EXPECTED_FORMAL_SPLIT_COUNTS",
     "FORMAL_NUM_BEAMS",
@@ -1123,6 +1261,7 @@ __all__ = [
     "rank_shard_bounds",
     "resolve_eval_loss",
     "run_formal_generation",
+    "run_local_formal_generation",
     "trainer_eval_loss_hook",
     "write_generation_fragment",
     "write_selection_proof",

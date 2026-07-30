@@ -133,9 +133,7 @@ def assert_host_ready(
     if not status.hostname.startswith("gu30"):
         raise RuntimeContractError(f"formal run is pinned to gu30, found {status.hostname!r}")
     if len(status.gpus) != required_gpu_count:
-        raise RuntimeContractError(
-            f"expected {required_gpu_count} GPUs, found {len(status.gpus)}"
-        )
+        raise RuntimeContractError(f"expected {required_gpu_count} GPUs, found {len(status.gpus)}")
     if any(gpu.name != "NVIDIA GeForce RTX 4090" for gpu in status.gpus):
         raise RuntimeContractError(f"unexpected GPU model(s): {[gpu.name for gpu in status.gpus]}")
     if status.mem_available_kib < minimum_mem_available_kib:
@@ -149,21 +147,11 @@ def frozen_distributed_environment() -> dict[str, str]:
     return {
         # Triton's small CUDA-driver helper is compiled lazily.  gu30 has the
         # Python runtime package but not the matching system -devel headers.
-        "CPATH": (
-            "/home/caoxiangyu/.cache/micromamba/envs/"
-            "janus-ts-cuda128/include/python3.11"
-        ),
+        "CPATH": ("/home/caoxiangyu/.cache/micromamba/envs/janus-ts-cuda128/include/python3.11"),
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "NCCL_P2P_DISABLE": "1",
         "NCCL_IB_DISABLE": "1",
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
-        # Formal inference reaches the card limit while retaining more than
-        # 1 GiB of fragmented native-allocator blocks. CUDA's async allocator
-        # can satisfy the remaining small loads from that reserved capacity.
-        "PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync",
-        # PyTorch 2.9.1's CUDA allocator still reads the legacy name even
-        # though another component emits a deprecation warning for it.
-        "PYTORCH_CUDA_ALLOC_CONF": "backend:cudaMallocAsync",
         "TOKENIZERS_PARALLELISM": "false",
         "PYTHONHASHSEED": "42",
         "DS_BUILD_OPS": "0",

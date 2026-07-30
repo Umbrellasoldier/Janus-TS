@@ -20,6 +20,7 @@ from janus_ts.zero_shot_runtime import (
     assert_zero_shot_engine_precision,
     build_zero_shot_baseline,
     load_zero3_zero_shot_model,
+    run_local_zero_shot_evaluation,
     run_zero_shot_evaluation,
 )
 
@@ -167,3 +168,60 @@ def test_zero_shot_runtime_uses_test_role_without_selection_proof(tmp_path: Path
     assert receipt is not None
     assert receipt.path.is_file()
     assert events.index("arguments") < events.index("model") < events.index("generate")
+
+
+def test_local_zero_shot_runtime_skips_trainer_and_uses_local_generation(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/transition1x.yaml")
+    processed = _processed(tmp_path)
+    output = tmp_path / "evaluation"
+    events: list[str] = []
+
+    def generation_runner(
+        _model: Any,
+        _tokenizer: Any,
+        _records: Any,
+        identity: Any,
+        **kwargs: Any,
+    ) -> Any:
+        events.append("generate")
+        assert kwargs["selection_proof_path"] is None
+        assert kwargs["test_role"] == "frozen_zero_shot"
+        predictions = merged_predictions_path(output, identity)
+        predictions.parent.mkdir(parents=True, exist_ok=True)
+        predictions.write_text("{}\n", encoding="utf-8")
+        metrics = metrics_path(output, identity)
+        write_json(
+            metrics,
+            {
+                "schema_version": EVALUATION_SCHEMA_VERSION,
+                **identity.to_json_dict(),
+                "predictions_sha256": sha256_file(predictions),
+                "eval_loss": None,
+                "evaluation": {},
+            },
+        )
+        lease = TestEvaluationLease(output, identity)
+        lease.acquire()
+        lease.complete(predictions_path=predictions, metrics_path_value=metrics)
+        return SimpleNamespace(predictions_path=predictions, metrics_path=metrics)
+
+    receipt = run_local_zero_shot_evaluation(
+        config,
+        processed_path=processed,
+        output_dir=output,
+        run_fingerprint="f" * 64,
+        environment_installer=lambda: events.append("environment"),
+        reproducibility_configurer=lambda *_args, **_kwargs: events.append("seed"),
+        model_loader=lambda *_args, **_kwargs: events.append("model") or object(),
+        tokenizer_loader=lambda *_args, **_kwargs: events.append("tokenizer") or object(),
+        data_preparer=lambda *_args, **_kwargs: PreparedFormalData(
+            records=(), eval_dataset=None, collator=object()
+        ),
+        generation_runner=generation_runner,
+        torch_module=object(),
+    )
+
+    assert receipt.path.is_file()
+    assert events == ["environment", "seed", "model", "tokenizer", "generate"]

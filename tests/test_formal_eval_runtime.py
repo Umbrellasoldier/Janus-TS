@@ -22,6 +22,7 @@ from janus_ts.formal_eval_runtime import (
     load_checkpoint_score,
     load_zero3_portable_model,
     run_formal_checkpoint_evaluation,
+    run_local_formal_checkpoint_evaluation,
     runtime_receipt_path,
     validate_runtime_receipt,
 )
@@ -204,6 +205,63 @@ def test_fractional_train_loss_checkpoint_is_valid_for_formal_evaluation(tmp_pat
     checkpoint = inspect_durable_checkpoint(checkpoint_dir, processed, config=config)
     assert checkpoint.epoch == 2.75
     assert checkpoint.global_step == 1370
+
+
+def test_local_formal_runtime_uses_device_map_model_and_global_token_loss(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/transition1x.yaml")
+    processed, checkpoint_dir, checkpoint = _formal_assets(tmp_path, config)
+    output = tmp_path / "output"
+    events: list[str] = []
+    prepared = PreparedFormalData(records=(), eval_dataset="eval", collator="collator")
+
+    def generation_runner(
+        _model: Any,
+        _tokenizer: Any,
+        _records: Any,
+        identity: Any,
+        **kwargs: Any,
+    ) -> Any:
+        events.append("generate")
+        assert kwargs["eval_loss"] == 0.125
+        predictions = merged_predictions_path(output, identity)
+        predictions.parent.mkdir(parents=True, exist_ok=True)
+        predictions.write_text("{}\n", encoding="utf-8")
+        metrics = metrics_path(output, identity)
+        write_json(
+            metrics,
+            _metrics_payload(
+                checkpoint,
+                "val",
+                sha256_file(predictions),
+                eval_loss=0.125,
+            ),
+        )
+        return SimpleNamespace(
+            predictions_path=predictions,
+            metrics_path=metrics,
+            eval_loss=0.125,
+        )
+
+    receipt = run_local_formal_checkpoint_evaluation(
+        config,
+        processed_path=processed,
+        checkpoint_dir=checkpoint_dir,
+        output_dir=output,
+        split="val",
+        environment_installer=lambda: events.append("environment"),
+        reproducibility_configurer=lambda *_args, **_kwargs: events.append("seed"),
+        model_loader=lambda *_args, **_kwargs: events.append("model") or object(),
+        tokenizer_loader=lambda *_args, **_kwargs: events.append("tokenizer") or object(),
+        data_preparer=lambda *_args, **_kwargs: prepared,
+        loss_evaluator=lambda model, dataset, collator: (events.append("loss") or 0.125),
+        generation_runner=generation_runner,
+        torch_module=object(),
+    )
+
+    assert receipt.payload["eval_loss"] == 0.125
+    assert events == ["environment", "seed", "model", "tokenizer", "loss", "generate"]
 
 
 class _TinyPortableModel(torch.nn.Module):

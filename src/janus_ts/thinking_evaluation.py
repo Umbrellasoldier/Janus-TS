@@ -27,25 +27,26 @@ from .artifacts import (
 )
 from .config import ExperimentConfig, load_config
 from .constants import FORMAL_EVAL_K
+from .device_map_runtime import (
+    load_device_map_portable_model,
+    load_device_map_zero_shot_model,
+)
 from .evaluation import aggregate_evaluations, evaluate_reaction
 from .formal_eval_runtime import (
     DurableCheckpoint,
     inspect_durable_checkpoint,
-    load_zero3_portable_model,
 )
 from .schema import ReactionRecord
 from .thinking_inference import (
     ThinkingExplorationReceipt,
     load_exploration_records,
-    run_thinking_inference,
+    run_local_thinking_inference,
     validate_exploration_artifact,
     validate_thinking_profile,
 )
 from .zero_shot_runtime import (
     ZeroShotBaseline,
     build_zero_shot_baseline,
-    load_zero3_zero_shot_model,
-    zero_shot_generation_module_from_trainer,
 )
 
 THINKING_EVALUATION_SCHEMA_VERSION = "janus-ts-thinking-test-evaluation-v2"
@@ -470,7 +471,7 @@ def run_thinking_test_evaluation(
     checkpoint_dir: str | Path | None = None,
     local_files_only: bool = True,
 ) -> ThinkingEvaluationReceipt:
-    """Run one complete 996-example thinking test under two-rank ZeRO-3."""
+    """Run one complete thinking test with a model dispatched across both GPUs."""
 
     validate_thinking_profile(config.thinking_generation)
     binding, model = build_thinking_binding(
@@ -492,14 +493,12 @@ def run_thinking_test_evaluation(
         def zero_loader(
             actual_config: ExperimentConfig,
             _checkpoint: Any,
-            arguments: Any,
             *,
             local_files_only: bool,
         ) -> Any:
-            return load_zero3_zero_shot_model(
+            return load_device_map_zero_shot_model(
                 actual_config,
                 baseline,
-                arguments,
                 local_files_only=local_files_only,
             )
 
@@ -510,7 +509,7 @@ def run_thinking_test_evaluation(
             run_fingerprint=binding.run_fingerprint,
             model_fingerprint=binding.model_fingerprint,
         )
-        raw_receipt = run_thinking_inference(
+        raw_receipt = run_local_thinking_inference(
             config,
             processed_path=processed_path,
             checkpoint_dir=processed_path,
@@ -521,13 +520,12 @@ def run_thinking_test_evaluation(
             local_files_only=local_files_only,
             checkpoint_inspector=lambda *_args, **_kwargs: synthetic,
             model_loader=zero_loader,
-            module_resolver=zero_shot_generation_module_from_trainer,
         )
     else:
         checkpoint = model
         if not isinstance(checkpoint, DurableCheckpoint):  # pragma: no cover - narrowed by role
             raise ThinkingEvaluationError("fine-tuned binding did not resolve a checkpoint")
-        raw_receipt = run_thinking_inference(
+        raw_receipt = run_local_thinking_inference(
             config,
             processed_path=processed_path,
             checkpoint_dir=checkpoint.path,
@@ -537,46 +535,42 @@ def run_thinking_test_evaluation(
             sample_count_per_reaction=THINKING_TEST_SAMPLE_COUNT,
             local_files_only=local_files_only,
             checkpoint_inspector=lambda *_args, **_kwargs: checkpoint,
-            model_loader=load_zero3_portable_model,
+            model_loader=load_device_map_portable_model,
         )
 
-    import torch
-
-    if int(os.environ.get("RANK", "0")) == 0:
-        records = load_exploration_records(config, processed_path, "test")
-        score_path = finalize_thinking_scores(
-            config,
-            output_dir,
-            raw_receipt,
-            binding,
-            records,
-        )
-        request_sha256 = str(raw_receipt.payload["request_sha256"])
-        predictions = score_path / "scored-predictions.jsonl"
-        metrics = score_path / "metrics.json"
-        receipt_payload = {
-            "schema_version": THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
-            "status": "complete",
-            **binding.to_json_dict(),
-            "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
-            "report_k": list(THINKING_TEST_REPORT_K),
-            "request_sha256": request_sha256,
-            "raw_artifact_path": str(raw_receipt.path.resolve()),
-            "raw_predictions_sha256": sha256_file(raw_receipt.path / "predictions.jsonl"),
-            "score_artifact_path": str(score_path.resolve()),
-            "scored_predictions": {
-                "path": str(predictions.resolve()),
-                "sha256": sha256_file(predictions),
-            },
-            "metrics": {"path": str(metrics.resolve()), "sha256": sha256_file(metrics)},
-        }
-        path = thinking_receipt_path(output_dir, binding)
-        if path.exists():
-            if json.loads(path.read_text(encoding="utf-8")) != receipt_payload:
-                raise ThinkingEvaluationError("existing thinking receipt differs")
-        else:
-            write_json(path, receipt_payload)
-    torch.distributed.barrier()
+    records = load_exploration_records(config, processed_path, "test")
+    score_path = finalize_thinking_scores(
+        config,
+        output_dir,
+        raw_receipt,
+        binding,
+        records,
+    )
+    request_sha256 = str(raw_receipt.payload["request_sha256"])
+    predictions = score_path / "scored-predictions.jsonl"
+    metrics = score_path / "metrics.json"
+    receipt_payload = {
+        "schema_version": THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        "status": "complete",
+        **binding.to_json_dict(),
+        "sample_count_per_reaction": THINKING_TEST_SAMPLE_COUNT,
+        "report_k": list(THINKING_TEST_REPORT_K),
+        "request_sha256": request_sha256,
+        "raw_artifact_path": str(raw_receipt.path.resolve()),
+        "raw_predictions_sha256": sha256_file(raw_receipt.path / "predictions.jsonl"),
+        "score_artifact_path": str(score_path.resolve()),
+        "scored_predictions": {
+            "path": str(predictions.resolve()),
+            "sha256": sha256_file(predictions),
+        },
+        "metrics": {"path": str(metrics.resolve()), "sha256": sha256_file(metrics)},
+    }
+    path = thinking_receipt_path(output_dir, binding)
+    if path.exists():
+        if json.loads(path.read_text(encoding="utf-8")) != receipt_payload:
+            raise ThinkingEvaluationError("existing thinking receipt differs")
+    else:
+        write_json(path, receipt_payload)
     receipt = validate_thinking_completion(output_dir, binding)
     if receipt is None:
         raise ThinkingEvaluationError("thinking evaluation returned without completion")
@@ -605,8 +599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_dir=arguments.checkpoint_dir,
         local_files_only=True,
     )
-    if int(os.environ.get("RANK", "0")) == 0:
-        print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
+    print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
     return 0
 
 

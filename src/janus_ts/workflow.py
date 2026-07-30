@@ -1,8 +1,9 @@
 """Content-addressed gu30 orchestration for the frozen Transition1x run.
 
 This module is deliberately a thin process supervisor, not a second trainer.
-Every CUDA-heavy operation runs in an isolated two-rank ``torchrun`` process
-under the project GPU lock. Durable
+Training and its gates run in isolated two-rank ``torchrun`` processes.
+Evaluation uses one process with the model dispatched across both GPUs under
+the same project GPU lock. Durable
 ordering comes only from content identities, explicit global steps, and
 completion markers; the gu30 wall clock and filesystem mtimes are never used.
 """
@@ -274,6 +275,17 @@ def torchrun_command(module: str, *arguments: str) -> tuple[str, ...]:
         "--standalone",
         "--nproc-per-node=2",
         "--module",
+        module,
+        *map(str, arguments),
+    )
+
+
+def python_module_command(module: str, *arguments: str) -> tuple[str, ...]:
+    """Build a single-process command from this project's uv environment."""
+
+    return (
+        str(project_executable("python")),
+        "-m",
         module,
         *map(str, arguments),
     )
@@ -1337,8 +1349,7 @@ def _preserve_best_train_loss_checkpoint(
     if index_path.exists():
         previous = _read_json(index_path)
         if (
-            previous.get("schema_version")
-            != "janus-ts-best-train-loss-checkpoint-v1"
+            previous.get("schema_version") != "janus-ts-best-train-loss-checkpoint-v1"
             or previous.get("run_fingerprint") != identity.run_fingerprint
             or isinstance(previous.get("train_loss"), bool)
             or not isinstance(previous.get("train_loss"), (int, float))
@@ -1828,9 +1839,8 @@ def _saved_checkpoint_sources(
                 manifest = read_complete_manifest(child)
             except (ArtifactError, OSError):
                 continue
-            if (
-                manifest.get("kind") not in {"rolling", "epoch"}
-                or any(manifest.get(key) != value for key, value in identity.items())
+            if manifest.get("kind") not in {"rolling", "epoch"} or any(
+                manifest.get(key) != value for key, value in identity.items()
             ):
                 continue
             step = manifest.get("global_step")
@@ -1878,8 +1888,7 @@ def resolve_checkpoint_candidates(
     eligible_losses = {
         step: value
         for step, value in losses.items()
-        if step % prepared.config.train.checkpoint_steps == 0
-        or step == final_epoch.global_step
+        if step % prepared.config.train.checkpoint_steps == 0 or step == final_epoch.global_step
     }
     if final_epoch.global_step not in eligible_losses:
         raise WorkflowError("final checkpoint has no train loss logged at its exact step")
@@ -1922,12 +1931,8 @@ def resolve_checkpoint_candidates(
         initial_fingerprint = final_manifest.get("pissa_initial_adapter_fingerprint")
         if not isinstance(initial_fingerprint, str):
             raise WorkflowError("final checkpoint lacks the PiSSA initialization fingerprint")
-        destination = (
-            prepared.paths.evaluation_checkpoints
-            / (
-                f"train-loss-step-{minimum_step:09d}-"
-                f"{minimum_source_fingerprint[:16]}"
-            )
+        destination = prepared.paths.evaluation_checkpoints / (
+            f"train-loss-step-{minimum_step:09d}-{minimum_source_fingerprint[:16]}"
         )
         materialized = materialize_train_loss_checkpoint(
             minimum_source,
@@ -2076,11 +2081,11 @@ def _formal_eval_command(
     ]
     if selection_proof is not None:
         arguments.extend(("--selection-proof", str(selection_proof.resolve())))
-    return torchrun_command("janus_ts.formal_eval_runtime", *arguments)
+    return python_module_command("janus_ts.formal_eval_runtime", *arguments)
 
 
 def _zero_shot_eval_command(prepared: PreparedRun) -> tuple[str, ...]:
-    return torchrun_command(
+    return python_module_command(
         "janus_ts.zero_shot_runtime",
         "--config",
         str(prepared.config_path),
@@ -2117,7 +2122,7 @@ def _thinking_eval_command(
         if checkpoint is None:
             raise WorkflowError("fine-tuned thinking requires the selected checkpoint")
         arguments.extend(("--checkpoint-dir", str(checkpoint.path.resolve())))
-    return torchrun_command("janus_ts.thinking_evaluation", *arguments)
+    return python_module_command("janus_ts.thinking_evaluation", *arguments)
 
 
 def _validate_generation_smoke(value: Any, config: ExperimentConfig) -> None:
@@ -2223,10 +2228,7 @@ def _run_portable_parity_gate(
     stage = (
         prepared.paths.project
         / "workflow"
-        / (
-            f"portable-parity-step-{checkpoint.global_step:09d}-"
-            f"{checkpoint.checkpoint_fingerprint}"
-        )
+        / (f"portable-parity-step-{checkpoint.global_step:09d}-{checkpoint.checkpoint_fingerprint}")
     )
     if report := load_stage(
         stage,
@@ -2315,14 +2317,10 @@ def _run_one_formal_evaluation(
     selection_proof: Path | None,
     runner: Runner,
 ) -> tuple[Path, Path]:
-    _run_portable_parity_gate(prepared, checkpoint, runner=runner)
     stage = (
         prepared.paths.project
         / "workflow"
-        / (
-            f"{split}-step-{checkpoint.global_step:09d}-"
-            f"{checkpoint.checkpoint_fingerprint}"
-        )
+        / (f"{split}-step-{checkpoint.global_step:09d}-{checkpoint.checkpoint_fingerprint}")
     )
     if (
         load_stage(
@@ -2885,6 +2883,7 @@ __all__ = [
     "make_checkpoint_callback_factory",
     "prepare_smoke_workflow",
     "project_executable",
+    "python_module_command",
     "resolve_checkpoint_candidates",
     "run_cpu_audits",
     "run_delegated_command",

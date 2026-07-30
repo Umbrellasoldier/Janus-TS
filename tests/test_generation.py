@@ -22,12 +22,14 @@ from janus_ts.generation import (
     encode_formal_prompt,
     evaluate_generation_rows,
     formal_generation_kwargs,
+    fragment_path,
     generate_reaction,
     load_merged_predictions,
     load_selection_proof,
     merge_generation_fragments,
     rank_shard_bounds,
     resolve_eval_loss,
+    run_local_formal_generation,
     trainer_eval_loss_hook,
     write_generation_fragment,
     write_selection_proof,
@@ -261,6 +263,34 @@ def test_atomic_fragments_merge_in_expected_id_order_and_strict_reload(
                 *[reaction.reaction_id for reaction in reactions[2:]],
             ],
         )
+
+
+def test_local_generation_keeps_two_fragments_and_disables_synced_gpus(
+    tmp_path: Path,
+) -> None:
+    tokenizer = FakeTokenizer()
+    target = serialize_target(reaction_record().ts_edges)
+    model = FakeModel(tokenizer, [target] * FORMAL_NUM_BEAMS)
+    reactions = tuple(reaction_record(f"rxn{index:04d}") for index in range(994))
+    formal_identity = identity()
+
+    result = run_local_formal_generation(
+        model,
+        tokenizer,
+        reactions,
+        formal_identity,
+        output_dir=tmp_path,
+        eval_loss=0.25,
+        progress_interval=2_000,
+    )
+
+    assert result.eval_loss == 0.25
+    assert result.predictions_path.is_file()
+    assert result.metrics_path.is_file()
+    assert fragment_path(tmp_path, formal_identity, rank=0).is_file()
+    assert fragment_path(tmp_path, formal_identity, rank=1).is_file()
+    assert model.last_kwargs is not None
+    assert model.last_kwargs["synced_gpus"] is False
 
 
 def test_generation_rows_use_shared_strict_evaluator_and_aggregate() -> None:

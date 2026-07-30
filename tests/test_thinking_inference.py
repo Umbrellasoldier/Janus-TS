@@ -22,6 +22,7 @@ from janus_ts.thinking_inference import (
     encode_thinking_prompt,
     finalize_exploration_artifact,
     generate_thinking_reaction,
+    run_local_thinking_inference,
     run_thinking_inference,
     schedule_equal_rank_calls,
     select_exploration_records,
@@ -228,6 +229,60 @@ def test_selection_is_finite_by_default_and_odd_counts_get_one_dummy() -> None:
         "rxn0001",
     ]
     assert [item.is_dummy for item in scheduled] == [False, False, False, True]
+
+
+def test_local_thinking_writes_both_logical_shards_without_synced_gpus(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/transition1x.yaml")
+    checkpoint = _checkpoint(tmp_path)
+    records = tuple(_record(f"rxn{index:04d}") for index in range(3))
+    synchronized_values: list[bool] = []
+
+    def generator(
+        _model: Any,
+        _tokenizer: Any,
+        record: ReactionRecord,
+        *,
+        ordinal: int,
+        synchronized: bool,
+        **_kwargs: Any,
+    ) -> ThinkingPrediction:
+        synchronized_values.append(synchronized)
+        return ThinkingPrediction(
+            reaction_id=record.reaction_id,
+            ordinal=ordinal,
+            atom_count=record.atom_count,
+            prompt_sha256="e" * 64,
+            prompt_tokens=10,
+            raw_responses=("response",),
+        )
+
+    torch_module = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    receipt = run_local_thinking_inference(
+        config,
+        processed_path=tmp_path / "processed",
+        checkpoint_dir=checkpoint.path,
+        output_dir=tmp_path / "output",
+        split="val",
+        limit=3,
+        sample_count_per_reaction=1,
+        environment_installer=lambda: None,
+        reproducibility_configurer=lambda *_args, **_kwargs: None,
+        checkpoint_inspector=lambda *_args, **_kwargs: checkpoint,
+        record_loader=lambda *_args, **_kwargs: records,
+        model_loader=lambda *_args, **_kwargs: object(),
+        tokenizer_loader=lambda *_args, **_kwargs: object(),
+        generator=generator,
+        torch_module=torch_module,
+        progress_interval=10,
+    )
+
+    assert receipt.payload["runtime_execution"] == "single-process-two-gpu-device-map"
+    assert receipt.payload["generation_execution"]["synced_gpus"] is False
+    assert synchronized_values == [False, False, False, False]
+    assert (receipt.path / "rank-00000-of-00002.jsonl").is_file()
+    assert (receipt.path / "rank-00001-of-00002.jsonl").is_file()
 
 
 def test_exploration_manifest_is_content_verified_and_formally_ineligible(

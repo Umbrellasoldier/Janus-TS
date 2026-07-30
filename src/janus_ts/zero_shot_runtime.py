@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,6 +27,7 @@ from .constants import (
     REPRESENTATION_VERSION,
     SYSTEM_PROMPT,
 )
+from .device_map_runtime import load_device_map_zero_shot_model
 from .distributed import (
     TorchrunContext,
     assert_initialized_two_rank_job,
@@ -49,6 +49,7 @@ from .generation import (
     GenerationIdentity,
     formal_generation_kwargs,
     run_formal_generation,
+    run_local_formal_generation,
 )
 from .modeling import load_qwen_text_base
 from .preprocessing import load_pinned_tokenizer
@@ -145,7 +146,7 @@ def build_zero_shot_baseline(
         "representation": REPRESENTATION_VERSION,
         "system_prompt_sha256": sha256_bytes(SYSTEM_PROMPT.encode("utf-8")),
         "enable_thinking": False,
-        "generation": formal_generation_kwargs(synchronized=True),
+        "generation": formal_generation_kwargs(synchronized=False),
     }
     return ZeroShotBaseline(
         data_fingerprint=data_fingerprint,
@@ -416,6 +417,59 @@ def run_zero_shot_evaluation(
     return receipt
 
 
+def run_local_zero_shot_evaluation(
+    config: ExperimentConfig,
+    *,
+    processed_path: str | Path,
+    output_dir: str | Path,
+    run_fingerprint: str,
+    local_files_only: bool = True,
+    environment_installer: Callable[[], Any] = install_frozen_environment,
+    reproducibility_configurer: Callable[..., None] = configure_reproducibility,
+    model_loader: Callable[..., Any] = load_device_map_zero_shot_model,
+    tokenizer_loader: Callable[..., Any] = load_pinned_tokenizer,
+    data_preparer: Callable[..., PreparedFormalData] = prepare_formal_data,
+    generation_runner: Callable[..., FormalEvaluationResult] = run_local_formal_generation,
+    torch_module: Any | None = None,
+) -> ZeroShotRuntimeReceipt:
+    """Run the raw-Qwen test baseline with one model dispatched across both GPUs."""
+
+    environment_installer()
+    baseline = build_zero_shot_baseline(
+        config,
+        processed_path,
+        run_fingerprint=run_fingerprint,
+    )
+    output_root = Path(output_dir)
+    recovered = validate_zero_shot_completion(output_root, baseline)
+    if recovered is not None:
+        return recovered
+    if torch_module is None:
+        import torch as torch_module
+    reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
+    model = model_loader(
+        config,
+        baseline,
+        local_files_only=local_files_only,
+    )
+    tokenizer = tokenizer_loader(config, local_files_only=local_files_only)
+    prepared = data_preparer(config, processed_path, tokenizer, "test")
+    generation_runner(
+        model,
+        tokenizer,
+        prepared.records,
+        baseline.generation_identity("test"),
+        output_dir=output_root,
+        eval_loss=None,
+        selection_proof_path=None,
+        test_role="frozen_zero_shot",
+    )
+    receipt = validate_zero_shot_completion(output_root, baseline)
+    if receipt is None:
+        raise ZeroShotRuntimeError("zero-shot generation returned without durable completion")
+    return receipt
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -427,15 +481,14 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    receipt = run_zero_shot_evaluation(
+    receipt = run_local_zero_shot_evaluation(
         load_config(arguments.config),
         processed_path=arguments.processed_path,
         output_dir=arguments.output_dir,
         run_fingerprint=arguments.run_fingerprint,
         local_files_only=True,
     )
-    if receipt is not None and int(os.environ.get("RANK", "0")) == 0:
-        print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
+    print(json.dumps(receipt.payload, sort_keys=True, allow_nan=False))
     return 0
 
 
@@ -455,6 +508,7 @@ __all__ = [
     "build_zero_shot_baseline",
     "load_zero3_zero_shot_model",
     "run_zero_shot_evaluation",
+    "run_local_zero_shot_evaluation",
     "validate_zero_shot_completion",
     "zero_shot_generation_module_from_trainer",
     "zero_shot_receipt_path",

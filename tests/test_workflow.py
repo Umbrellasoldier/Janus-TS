@@ -189,6 +189,12 @@ def test_torchrun_is_absolute_two_rank_project_executable():
     assert command[-2:] == ("--x", "1")
 
 
+def test_python_module_command_is_absolute_single_process_project_executable():
+    command = workflow.python_module_command("janus_ts.formal_eval_runtime", "--x", "1")
+    assert Path(command[0]).is_absolute()
+    assert command[1:] == ("-m", "janus_ts.formal_eval_runtime", "--x", "1")
+
+
 def test_delegated_failure_classification_and_gate_timeout(monkeypatch):
     calls: list[dict[str, object]] = []
 
@@ -712,7 +718,11 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
     phases: list[str] = []
     mode_order: list[str] = []
 
-    monkeypatch.setattr(workflow, "_run_portable_parity_gate", lambda *a, **k: {})
+    monkeypatch.setattr(
+        workflow,
+        "_run_portable_parity_gate",
+        lambda *a, **k: pytest.fail("formal evaluation must not run portable parity"),
+    )
 
     def delegated(phase, command, **kwargs):
         del kwargs
