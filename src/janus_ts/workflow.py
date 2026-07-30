@@ -283,8 +283,11 @@ def torchrun_command(module: str, *arguments: str) -> tuple[str, ...]:
 def python_module_command(module: str, *arguments: str) -> tuple[str, ...]:
     """Build a single-process command from this project's uv environment."""
 
+    python = PROJECT_ROOT / ".venv" / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        raise WorkflowError(f"required project executable is unavailable: {python}")
     return (
-        str(project_executable("python")),
+        str(python),
         "-m",
         module,
         *map(str, arguments),

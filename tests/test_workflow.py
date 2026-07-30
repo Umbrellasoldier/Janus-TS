@@ -192,6 +192,7 @@ def test_torchrun_is_absolute_two_rank_project_executable():
 def test_python_module_command_is_absolute_single_process_project_executable():
     command = workflow.python_module_command("janus_ts.formal_eval_runtime", "--x", "1")
     assert Path(command[0]).is_absolute()
+    assert command[0].endswith("/.venv/bin/python")
     assert command[1:] == ("-m", "janus_ts.formal_eval_runtime", "--x", "1")
 
 
