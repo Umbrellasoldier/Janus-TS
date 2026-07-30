@@ -875,7 +875,6 @@ def run_thinking_inference(
 
     # This ordering is critical: TrainingArguments activates ZeRO.Init before
     # the original 27B base and portable adapter are materialized.
-    arguments = arguments_factory(config, output_dir=run_root)
     if torch_module is None:
         import torch as torch_module
     reproducibility_configurer(
@@ -883,6 +882,7 @@ def run_thinking_inference(
         seed=config.seed,
         cuda_device=context.local_rank,
     )
+    arguments = arguments_factory(config, output_dir=run_root)
     context_validator(arguments, context, torch_module)
     model = model_loader(
         config,

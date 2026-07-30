@@ -702,11 +702,6 @@ def _build_synthetic_trainer(
 ) -> tuple[Any, Any]:
     """Build one real two-update Trainer; arguments deliberately precede model."""
 
-    arguments = _build_two_step_arguments(
-        config,
-        output_dir=output_dir,
-        micro_batch_size=micro_batch_size,
-    )
     import torch
 
     context = preflight_torchrun_environment()
@@ -714,6 +709,11 @@ def _build_synthetic_trainer(
         torch,
         seed=config.seed,
         cuda_device=context.local_rank,
+    )
+    arguments = _build_two_step_arguments(
+        config,
+        output_dir=output_dir,
+        micro_batch_size=micro_batch_size,
     )
     assert_initialized_two_rank_job(arguments, context, torch)
     model = load_zero3_prepared_model(bundle, arguments)
@@ -1127,7 +1127,6 @@ def _build_inference_branch(
     output_dir: Path,
     kind: Literal["residual-rank32", "original-portable-rank64"],
 ) -> _InferenceBranch:
-    arguments = build_formal_eval_arguments(config, output_dir=output_dir)
     import torch
 
     context = preflight_torchrun_environment()
@@ -1136,6 +1135,7 @@ def _build_inference_branch(
         seed=config.seed,
         cuda_device=context.local_rank,
     )
+    arguments = build_formal_eval_arguments(config, output_dir=output_dir)
     assert_initialized_two_rank_job(arguments, context, torch)
     if kind == "residual-rank32":
         model = _load_zero3_resume_adapter_model(bundle, checkpoint, arguments)

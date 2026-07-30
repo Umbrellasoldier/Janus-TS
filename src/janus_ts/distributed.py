@@ -749,18 +749,18 @@ def run_memory_smoke(
             "world_size": 2,
         }
     )
-    # This must precede model_loader: it activates Transformers' ZeRO-3 Init.
-    arguments = build_memory_smoke_arguments(
-        config,
-        output_dir=output_dir,
-        micro_batch_size_per_gpu=micro_batch_size_per_gpu,
-    )
     import torch
 
     configure_reproducibility(
         torch,
         seed=config.seed,
         cuda_device=context.local_rank,
+    )
+    # This must precede model_loader: it activates Transformers' ZeRO-3 Init.
+    arguments = build_memory_smoke_arguments(
+        config,
+        output_dir=output_dir,
+        micro_batch_size_per_gpu=micro_batch_size_per_gpu,
     )
     assert_initialized_two_rank_job(arguments, context, torch)
     device = torch.device("cuda", context.local_rank)
@@ -926,19 +926,19 @@ def build_full_distributed_run(
 
     install_frozen_environment()
     context = preflight_torchrun_environment()
-    # Do not move this below model_loader.  The ordering is a 27B memory gate.
-    arguments = build_training_arguments(
-        config,
-        output_dir=output_dir,
-        micro_batch_size_per_gpu=micro_batch_size_per_gpu,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-    )
     import torch
 
     configure_reproducibility(
         torch,
         seed=config.seed,
         cuda_device=context.local_rank,
+    )
+    # Do not move this below model_loader.  The ordering is a 27B memory gate.
+    arguments = build_training_arguments(
+        config,
+        output_dir=output_dir,
+        micro_batch_size_per_gpu=micro_batch_size_per_gpu,
+        gradient_accumulation_steps=gradient_accumulation_steps,
     )
     assert_initialized_two_rank_job(arguments, context, torch)
     model = model_loader(bundle_dir, arguments)

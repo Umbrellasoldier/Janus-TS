@@ -1052,8 +1052,6 @@ def run_formal_checkpoint_evaluation(
             return recovered
 
     context = context_loader()
-    # Do not move model_loader above this call: TrainingArguments owns Zero.Init.
-    arguments = arguments_factory(config, output_dir=output_root)
     if torch_module is None:
         import torch as torch_module
     reproducibility_configurer(
@@ -1061,6 +1059,8 @@ def run_formal_checkpoint_evaluation(
         seed=config.seed,
         cuda_device=context.local_rank,
     )
+    # Do not move model_loader above this call: TrainingArguments owns Zero.Init.
+    arguments = arguments_factory(config, output_dir=output_root)
     context_validator(arguments, context, torch_module)
     model = model_loader(
         config,

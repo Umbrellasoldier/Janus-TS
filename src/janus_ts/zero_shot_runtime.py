@@ -378,7 +378,6 @@ def run_zero_shot_evaluation(
         return recovered
 
     context = context_loader()
-    arguments = arguments_factory(config, output_dir=output_root / "zero-shot")
     if torch_module is None:
         import torch as torch_module
     reproducibility_configurer(
@@ -386,6 +385,7 @@ def run_zero_shot_evaluation(
         seed=config.seed,
         cuda_device=context.local_rank,
     )
+    arguments = arguments_factory(config, output_dir=output_root / "zero-shot")
     context_validator(arguments, context, torch_module)
     model = model_loader(
         config,

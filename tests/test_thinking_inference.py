@@ -390,8 +390,8 @@ def test_full_runtime_is_cpu_injectable_and_reuses_formal_restore_chain(
     assert events.index("arguments") < events.index("original-base-plus-portable")
     assert events == [
         "environment",
-        "arguments",
         "seed",
+        "arguments",
         "two-rank-zero3",
         "original-base-plus-portable",
         "deepspeed-engine",
