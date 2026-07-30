@@ -16,6 +16,7 @@ from janus_ts.formal_eval_runtime import (
     DurableCheckpoint,
     FormalEvalRuntimeError,
     PreparedFormalData,
+    _formal_inference_deepspeed_config,
     assert_formal_zero3_precision,
     inspect_durable_checkpoint,
     load_checkpoint_score,
@@ -109,6 +110,22 @@ def _fraction(value: int, denominator: int) -> dict[str, int | float]:
         "denominator": exact.denominator,
         "value": float(exact),
     }
+
+
+def test_formal_inference_removes_training_only_zero3_buffers() -> None:
+    config = load_config("configs/transition1x.yaml")
+
+    payload = _formal_inference_deepspeed_config(config)
+    zero = payload["zero_optimization"]
+
+    assert payload["bf16"]["enabled"] is True
+    assert zero["stage"] == 3
+    assert zero["offload_param"] == {"device": "none"}
+    assert zero["overlap_comm"] is False
+    assert zero["contiguous_gradients"] is False
+    assert zero["reduce_bucket_size"] == 4_000_000
+    assert zero["stage3_prefetch_bucket_size"] == 4_000_000
+    assert zero["stage3_param_persistence_threshold"] == 0
 
 
 def _metrics_payload(

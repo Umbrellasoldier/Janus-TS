@@ -411,6 +411,7 @@ def build_formal_eval_arguments(
     """Create eval-only arguments; this must run before the 27B model loader."""
 
     kwargs = build_training_argument_kwargs(config, output_dir=Path(output_dir) / "trainer")
+    kwargs["deepspeed"] = _formal_inference_deepspeed_config(config)
     kwargs.update(
         {
             "do_train": False,
@@ -427,6 +428,34 @@ def build_formal_eval_arguments(
     from transformers import TrainingArguments
 
     return TrainingArguments(**kwargs)
+
+
+def _formal_inference_deepspeed_config(config: ExperimentConfig) -> dict[str, Any]:
+    """Trim training-only ZeRO-3 buffers while retaining BF16 GPU inference."""
+
+    path = Path(config.train.deepspeed_config)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FormalEvalRuntimeError(f"cannot read DeepSpeed config: {path}") from exc
+    if not isinstance(payload, dict):
+        raise FormalEvalRuntimeError("DeepSpeed config root must be an object")
+    zero = payload.get("zero_optimization")
+    if not isinstance(zero, dict) or zero.get("stage") != 3:
+        raise FormalEvalRuntimeError("formal inference requires DeepSpeed ZeRO stage 3")
+
+    # Formal evaluation has no backward pass.  Training-sized overlapping
+    # reduction buffers only consume the small margin left by the 27B model.
+    zero.update(
+        {
+            "overlap_comm": False,
+            "contiguous_gradients": False,
+            "reduce_bucket_size": 4_000_000,
+            "stage3_prefetch_bucket_size": 4_000_000,
+            "stage3_param_persistence_threshold": 0,
+        }
+    )
+    return payload
 
 
 def _is_lora_parameter(name: str) -> bool:
