@@ -158,16 +158,16 @@ def frozen_distributed_environment() -> dict[str, str]:
         "NCCL_IB_DISABLE": "1",
         "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
         # Formal inference sits within ~200 MiB of the card limit. Expandable
-        # segments let PyTorch reuse its reserved 2+ GiB instead of failing a
-        # small contiguous allocation after the 27B model has loaded.
+        # segments and generous non-split rounding let PyTorch reuse reserved
+        # blocks for small allocations after the 27B model has loaded.
         "PYTORCH_ALLOC_CONF": (
-            "expandable_segments:True,max_split_size_mb:128,"
+            "expandable_segments:True,max_non_split_rounding_mb:1024,"
             "garbage_collection_threshold:0.8"
         ),
         # PyTorch 2.9.1's CUDA allocator still reads the legacy name even
         # though another component emits a deprecation warning for it.
         "PYTORCH_CUDA_ALLOC_CONF": (
-            "expandable_segments:True,max_split_size_mb:128,"
+            "expandable_segments:True,max_non_split_rounding_mb:1024,"
             "garbage_collection_threshold:0.8"
         ),
         "TOKENIZERS_PARALLELISM": "false",
