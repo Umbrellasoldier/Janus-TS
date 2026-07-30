@@ -200,10 +200,10 @@ evaluation checkpoint; optimizer state is not copied. No other checkpoint is
 validated. After locking the winner, only that fine-tuned checkpoint is
 evaluated on the complete 996-example test split, in this overall order:
 
-1. original Qwen zero-shot, non-thinking;
-2. original Qwen zero-shot, thinking;
-3. selected fine-tuned checkpoint, non-thinking;
-4. selected fine-tuned checkpoint, thinking.
+1. selected fine-tuned checkpoint, non-thinking;
+2. selected fine-tuned checkpoint, thinking;
+3. original Qwen zero-shot, non-thinking;
+4. original Qwen zero-shot, thinking.
 
 The original pinned `Qwen/Qwen3.6-27B` is loaded directly in BF16 without
 PiSSA or LoRA. Both non-thinking modes use the identical `MoleCode-TS/v1`

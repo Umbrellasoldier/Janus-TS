@@ -36,8 +36,9 @@ checkpoint and the final checkpoint on validation (one run if they coincide).
 Each candidate's rank-64 portable adapter is checked against its rank-32
 resume form before formal validation. After the @10 lexicographic winner is
 locked, only that fine-tuned checkpoint is used for the complete
-996-reaction test split. The four modes run in this order: raw-Qwen non-thinking, raw-Qwen
-thinking, selected-checkpoint non-thinking, selected-checkpoint thinking.
+996-reaction test split. The four modes run in this order: selected-checkpoint
+non-thinking, selected-checkpoint thinking, raw-Qwen non-thinking, raw-Qwen
+thinking.
 Non-thinking uses deterministic beam 10 and reports @1/@2/@3/@4/@5/@10.
 Each complete-test thinking call returns ten independently sampled candidates
 in one batch, retains every raw reasoning trace, and scores the answers after

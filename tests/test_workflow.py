@@ -823,10 +823,10 @@ def test_evaluation_phase_is_idempotent_and_runs_locked_test_once(tmp_path, monk
         "formal-test-step-000000300",
     ]
     assert mode_order[:4] == [
-        "zero-shot/non-thinking",
-        "zero-shot/thinking",
         "fine-tuned/non-thinking",
         "fine-tuned/thinking",
+        "zero-shot/non-thinking",
+        "zero-shot/thinking",
     ]
     state = json.loads((prepared.paths.project / "state.json").read_text(encoding="utf-8"))
     assert state["stage"] == "complete"

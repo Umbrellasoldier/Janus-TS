@@ -2667,10 +2667,10 @@ def _write_inference_mode_comparison(
         "run_fingerprint": prepared.run_identity.fingerprint,
         "test_count": 996,
         "execution_order": [
-            "zero-shot/non-thinking",
-            "zero-shot/thinking",
             "fine-tuned/non-thinking",
             "fine-tuned/thinking",
+            "zero-shot/non-thinking",
+            "zero-shot/thinking",
         ],
         "fine_tuned_qwen": {
             "selected_epoch": selected.epoch,
@@ -2779,16 +2779,6 @@ def run_evaluation_phase(
         stage="testing",
         global_step=epochs[-1].global_step,
     )
-    baseline, baseline_metrics, baseline_predictions = _run_zero_shot_baseline(
-        prepared,
-        runner=runner,
-    )
-    zero_shot_thinking = _run_thinking_test(
-        prepared,
-        role="zero-shot",
-        checkpoint=None,
-        runner=runner,
-    )
     selected_metrics, selected_predictions = _run_one_formal_evaluation(
         prepared,
         selected,
@@ -2800,6 +2790,16 @@ def run_evaluation_phase(
         prepared,
         role="fine-tuned",
         checkpoint=selected,
+        runner=runner,
+    )
+    baseline, baseline_metrics, baseline_predictions = _run_zero_shot_baseline(
+        prepared,
+        runner=runner,
+    )
+    zero_shot_thinking = _run_thinking_test(
+        prepared,
+        role="zero-shot",
+        checkpoint=None,
         runner=runner,
     )
     comparison = _write_inference_mode_comparison(
