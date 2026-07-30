@@ -376,12 +376,19 @@ def configure_reproducibility(torch_module: Any, *, seed: int = SEED) -> None:
     torch_module.backends.cuda.matmul.allow_tf32 = False
 
 
-def _load_deepspeed_payload(path: str | Path) -> dict[str, Any]:
-    config_path = Path(path)
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DistributedTrainingError(f"invalid DeepSpeed config {config_path}: {exc}") from exc
+def _load_deepspeed_payload(
+    source: str | Path | Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(source, Mapping):
+        payload = dict(source)
+    else:
+        config_path = Path(source)
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DistributedTrainingError(
+                f"invalid DeepSpeed config {config_path}: {exc}"
+            ) from exc
     if not isinstance(payload, dict):
         raise DistributedTrainingError("DeepSpeed config must be a JSON object")
     return payload

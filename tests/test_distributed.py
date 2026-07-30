@@ -91,6 +91,21 @@ def test_zero3_contract_requires_early_activation_and_no_offload(tmp_path):
         assert_zero3_no_offload(bad_plugin, zero3_enabled=lambda: True)
 
 
+def test_zero3_contract_accepts_in_memory_deepspeed_config() -> None:
+    arguments = _deepspeed_arguments(
+        Path("unused.json"),
+        deepspeed={
+            "zero_optimization": {
+                "stage": 3,
+                "offload_optimizer": {"device": "none"},
+                "offload_param": {"device": "none"},
+            }
+        },
+    )
+
+    assert_zero3_no_offload(arguments, zero3_enabled=lambda: True)
+
+
 def test_worst_case_synthetic_examples_are_exactly_2048_tokens():
     dataset = SyntheticSequenceDataset(3)
     feature = dataset[0]
