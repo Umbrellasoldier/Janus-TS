@@ -123,6 +123,7 @@ def test_formal_inference_removes_training_only_zero3_buffers() -> None:
     assert zero["offload_param"] == {"device": "none"}
     assert zero["overlap_comm"] is False
     assert zero["contiguous_gradients"] is False
+    assert zero["allgather_bucket_size"] == 4_000_000
     assert zero["reduce_bucket_size"] == 4_000_000
     assert zero["stage3_prefetch_bucket_size"] == 4_000_000
     assert zero["stage3_param_persistence_threshold"] == 0

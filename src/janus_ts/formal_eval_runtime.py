@@ -450,6 +450,7 @@ def _formal_inference_deepspeed_config(config: ExperimentConfig) -> dict[str, An
         {
             "overlap_comm": False,
             "contiguous_gradients": False,
+            "allgather_bucket_size": 4_000_000,
             "reduce_bucket_size": 4_000_000,
             "stage3_prefetch_bucket_size": 4_000_000,
             "stage3_param_persistence_threshold": 0,
