@@ -148,7 +148,7 @@ def test_zero_shot_runtime_uses_test_role_without_selection_proof(tmp_path: Path
         output_dir=output,
         run_fingerprint="f" * 64,
         environment_installer=lambda: events.append("environment"),
-        context_loader=lambda: events.append("context") or object(),
+        context_loader=lambda: events.append("context") or SimpleNamespace(local_rank=0),
         arguments_factory=lambda *_args, **_kwargs: events.append("arguments") or object(),
         context_validator=lambda *_args: events.append("context_valid"),
         reproducibility_configurer=lambda *_args, **_kwargs: events.append("seed"),

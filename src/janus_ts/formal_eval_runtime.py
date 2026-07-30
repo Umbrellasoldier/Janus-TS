@@ -1056,7 +1056,11 @@ def run_formal_checkpoint_evaluation(
     arguments = arguments_factory(config, output_dir=output_root)
     if torch_module is None:
         import torch as torch_module
-    reproducibility_configurer(torch_module, seed=config.seed)
+    reproducibility_configurer(
+        torch_module,
+        seed=config.seed,
+        cuda_device=context.local_rank,
+    )
     context_validator(arguments, context, torch_module)
     model = model_loader(
         config,

@@ -357,7 +357,12 @@ def preflight_torchrun_environment(
     return TorchrunContext(rank, local_rank, world_size, local_rank)
 
 
-def configure_reproducibility(torch_module: Any, *, seed: int = SEED) -> None:
+def configure_reproducibility(
+    torch_module: Any,
+    *,
+    seed: int = SEED,
+    cuda_device: int | None = None,
+) -> None:
     """Install the confirmed reproducibility policy without strict algorithms."""
 
     if seed != SEED:
@@ -366,9 +371,18 @@ def configure_reproducibility(torch_module: Any, *, seed: int = SEED) -> None:
 
     random.seed(seed)
     np.random.seed(seed)
-    torch_module.manual_seed(seed)
+    torch_module.default_generator.manual_seed(seed)
     if torch_module.cuda.is_available():
-        torch_module.cuda.manual_seed_all(seed)
+        if (
+            isinstance(cuda_device, bool)
+            or not isinstance(cuda_device, int)
+            or not 0 <= cuda_device < torch_module.cuda.device_count()
+        ):
+            raise DistributedTrainingError(
+                f"CUDA reproducibility requires a valid local device, got {cuda_device!r}"
+            )
+        torch_module.cuda.set_device(cuda_device)
+        torch_module.cuda.manual_seed(seed)
     torch_module.use_deterministic_algorithms(False)
     torch_module.backends.cudnn.benchmark = False
     torch_module.backends.cudnn.deterministic = False
@@ -743,7 +757,11 @@ def run_memory_smoke(
     )
     import torch
 
-    configure_reproducibility(torch, seed=config.seed)
+    configure_reproducibility(
+        torch,
+        seed=config.seed,
+        cuda_device=context.local_rank,
+    )
     assert_initialized_two_rank_job(arguments, context, torch)
     device = torch.device("cuda", context.local_rank)
     torch.cuda.reset_peak_memory_stats(device)
@@ -917,7 +935,11 @@ def build_full_distributed_run(
     )
     import torch
 
-    configure_reproducibility(torch, seed=config.seed)
+    configure_reproducibility(
+        torch,
+        seed=config.seed,
+        cuda_device=context.local_rank,
+    )
     assert_initialized_two_rank_job(arguments, context, torch)
     model = model_loader(bundle_dir, arguments)
     tokenizer = load_pinned_tokenizer(config, local_files_only=local_files_only)

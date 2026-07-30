@@ -203,20 +203,26 @@ def test_model_precision_contract_uses_logical_adapter_count():
 def test_reproducibility_policy_is_seed_42_and_non_strict(monkeypatch):
     calls = []
     fake_torch = SimpleNamespace(
-        manual_seed=lambda seed: calls.append(("manual_seed", seed)),
+        default_generator=SimpleNamespace(
+            manual_seed=lambda seed: calls.append(("cpu_seed", seed))
+        ),
         use_deterministic_algorithms=lambda value: calls.append(("deterministic", value)),
         cuda=SimpleNamespace(
             is_available=lambda: True,
-            manual_seed_all=lambda seed: calls.append(("cuda_seed", seed)),
+            device_count=lambda: 2,
+            set_device=lambda device: calls.append(("cuda_device", device)),
+            manual_seed=lambda seed: calls.append(("cuda_seed", seed)),
+            manual_seed_all=lambda _seed: pytest.fail("must not seed the peer GPU"),
         ),
         backends=SimpleNamespace(
             cudnn=SimpleNamespace(benchmark=True, deterministic=True, allow_tf32=True),
             cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=True)),
         ),
     )
-    configure_reproducibility(fake_torch)
+    configure_reproducibility(fake_torch, cuda_device=1)
 
-    assert ("manual_seed", 42) in calls
+    assert ("cpu_seed", 42) in calls
+    assert ("cuda_device", 1) in calls
     assert ("cuda_seed", 42) in calls
     assert ("deterministic", False) in calls
     assert fake_torch.backends.cudnn.benchmark is False
@@ -224,7 +230,7 @@ def test_reproducibility_policy_is_seed_42_and_non_strict(monkeypatch):
     assert fake_torch.backends.cudnn.allow_tf32 is False
     assert fake_torch.backends.cuda.matmul.allow_tf32 is False
     with pytest.raises(DistributedTrainingError, match="frozen seed"):
-        configure_reproducibility(fake_torch, seed=7)
+        configure_reproducibility(fake_torch, seed=7, cuda_device=1)
 
 
 def test_clean_oom_outcome_has_dedicated_exit_code():

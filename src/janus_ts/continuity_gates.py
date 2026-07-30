@@ -710,7 +710,11 @@ def _build_synthetic_trainer(
     import torch
 
     context = preflight_torchrun_environment()
-    configure_reproducibility(torch, seed=config.seed)
+    configure_reproducibility(
+        torch,
+        seed=config.seed,
+        cuda_device=context.local_rank,
+    )
     assert_initialized_two_rank_job(arguments, context, torch)
     model = load_zero3_prepared_model(bundle, arguments)
     accumulation = int(arguments.gradient_accumulation_steps)
@@ -1127,7 +1131,11 @@ def _build_inference_branch(
     import torch
 
     context = preflight_torchrun_environment()
-    configure_reproducibility(torch, seed=config.seed)
+    configure_reproducibility(
+        torch,
+        seed=config.seed,
+        cuda_device=context.local_rank,
+    )
     assert_initialized_two_rank_job(arguments, context, torch)
     if kind == "residual-rank32":
         model = _load_zero3_resume_adapter_model(bundle, checkpoint, arguments)

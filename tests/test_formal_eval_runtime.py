@@ -393,7 +393,7 @@ def test_validation_runtime_orders_zero_init_before_model_and_writes_receipt(
         output_dir=output,
         split="val",
         environment_installer=lambda: events.append("environment"),
-        context_loader=lambda: events.append("context") or SimpleNamespace(),
+        context_loader=lambda: events.append("context") or SimpleNamespace(local_rank=0),
         arguments_factory=lambda _config, **_kwargs: events.append("arguments") or object(),
         context_validator=lambda *_args: events.append("context_valid"),
         reproducibility_configurer=lambda *_args, **_kwargs: events.append("seed"),
