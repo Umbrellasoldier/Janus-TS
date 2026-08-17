@@ -16,3 +16,8 @@ logs/
 !.env.example
 .idea/
 .vscode/
+
+# Local agent and skill configuration.
+.agents/
+.claude/
+skills-lock.json
