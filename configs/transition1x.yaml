@@ -77,7 +77,7 @@ generation:
 thinking_generation:
   enable_thinking: true
   num_beams: 1
-  # Base subset-exploration value; complete-test evaluation records and applies 10.
+  # Subset exploration and complete-test evaluation both use one sampled candidate.
   num_return_sequences: 1
   do_sample: true
   temperature: 0.6

@@ -26,11 +26,6 @@ from .artifacts import (
     write_json,
 )
 from .config import ExperimentConfig, load_config
-from .constants import FORMAL_EVAL_K
-from .device_map_runtime import (
-    load_device_map_portable_model,
-    load_device_map_zero_shot_model,
-)
 from .evaluation import aggregate_evaluations, evaluate_reaction
 from .formal_eval_runtime import (
     DurableCheckpoint,
@@ -40,20 +35,20 @@ from .schema import ReactionRecord
 from .thinking_inference import (
     ThinkingExplorationReceipt,
     load_exploration_records,
-    run_local_thinking_inference,
     validate_exploration_artifact,
     validate_thinking_profile,
 )
+from .vllm_thinking import run_vllm_thinking_inference
 from .zero_shot_runtime import (
     ZeroShotBaseline,
     build_zero_shot_baseline,
 )
 
-THINKING_EVALUATION_SCHEMA_VERSION = "janus-ts-thinking-test-evaluation-v2"
-THINKING_SCORE_ROW_SCHEMA_VERSION = "janus-ts-thinking-score-row-v2"
-THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION = "janus-ts-thinking-runtime-receipt-v2"
-THINKING_TEST_REPORT_K = FORMAL_EVAL_K
-THINKING_TEST_SAMPLE_COUNT = max(THINKING_TEST_REPORT_K)
+THINKING_EVALUATION_SCHEMA_VERSION = "janus-ts-thinking-test-evaluation-v3"
+THINKING_SCORE_ROW_SCHEMA_VERSION = "janus-ts-thinking-score-row-v3"
+THINKING_RUNTIME_RECEIPT_SCHEMA_VERSION = "janus-ts-thinking-runtime-receipt-v3"
+THINKING_TEST_REPORT_K = (1,)
+THINKING_TEST_SAMPLE_COUNT = 1
 ThinkingRole = Literal["zero-shot", "fine-tuned"]
 _ROLES: tuple[ThinkingRole, ...] = ("zero-shot", "fine-tuned")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -471,7 +466,7 @@ def run_thinking_test_evaluation(
     checkpoint_dir: str | Path | None = None,
     local_files_only: bool = True,
 ) -> ThinkingEvaluationReceipt:
-    """Run one complete thinking test with a model dispatched across both GPUs."""
+    """Run one complete thinking test through the pinned two-GPU vLLM runtime."""
 
     validate_thinking_profile(config.thinking_generation)
     binding, model = build_thinking_binding(
@@ -489,19 +484,6 @@ def run_thinking_test_evaluation(
         baseline = model
         if not isinstance(baseline, ZeroShotBaseline):  # pragma: no cover - narrowed by role
             raise ThinkingEvaluationError("zero-shot binding did not resolve the raw model")
-
-        def zero_loader(
-            actual_config: ExperimentConfig,
-            _checkpoint: Any,
-            *,
-            local_files_only: bool,
-        ) -> Any:
-            return load_device_map_zero_shot_model(
-                actual_config,
-                baseline,
-                local_files_only=local_files_only,
-            )
-
         synthetic = _ZeroShotThinkingCheckpoint(
             path=Path(config.model.cache_dir) / "models--Qwen--Qwen3.6-27B",
             checkpoint_fingerprint=binding.checkpoint_fingerprint,
@@ -509,33 +491,31 @@ def run_thinking_test_evaluation(
             run_fingerprint=binding.run_fingerprint,
             model_fingerprint=binding.model_fingerprint,
         )
-        raw_receipt = run_local_thinking_inference(
+        raw_receipt = run_vllm_thinking_inference(
             config,
             processed_path=processed_path,
-            checkpoint_dir=processed_path,
+            checkpoint=synthetic,
             output_dir=output_dir,
             split="test",
             limit=config.data.expected_retained_counts["test"],
             sample_count_per_reaction=THINKING_TEST_SAMPLE_COUNT,
+            portable_adapter=None,
             local_files_only=local_files_only,
-            checkpoint_inspector=lambda *_args, **_kwargs: synthetic,
-            model_loader=zero_loader,
         )
     else:
         checkpoint = model
         if not isinstance(checkpoint, DurableCheckpoint):  # pragma: no cover - narrowed by role
             raise ThinkingEvaluationError("fine-tuned binding did not resolve a checkpoint")
-        raw_receipt = run_local_thinking_inference(
+        raw_receipt = run_vllm_thinking_inference(
             config,
             processed_path=processed_path,
-            checkpoint_dir=checkpoint.path,
+            checkpoint=checkpoint,
             output_dir=output_dir,
             split="test",
             limit=config.data.expected_retained_counts["test"],
             sample_count_per_reaction=THINKING_TEST_SAMPLE_COUNT,
+            portable_adapter=checkpoint.portable_adapter_path,
             local_files_only=local_files_only,
-            checkpoint_inspector=lambda *_args, **_kwargs: checkpoint,
-            model_loader=load_device_map_portable_model,
         )
 
     records = load_exploration_records(config, processed_path, "test")

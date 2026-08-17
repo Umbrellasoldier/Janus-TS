@@ -2662,7 +2662,7 @@ def _write_inference_mode_comparison(
 
     output = prepared.paths.evaluations / "inference-mode-comparison.json"
     payload = {
-        "schema_version": "janus-ts-four-mode-comparison-v3",
+        "schema_version": "janus-ts-four-mode-comparison-v4",
         "data_fingerprint": prepared.run_identity.data_fingerprint,
         "run_fingerprint": prepared.run_identity.fingerprint,
         "test_count": 996,

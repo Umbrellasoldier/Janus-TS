@@ -73,9 +73,10 @@ from .runtime import install_frozen_environment
 from .schema import ReactionRecord
 from .tokenization import EMPTY_THINK_PREFIX, CausalLMCollator
 
-THINKING_EXPLORATION_SCHEMA_VERSION = "janus-ts-thinking-exploration-v2"
+THINKING_EXPLORATION_SCHEMA_VERSION = "janus-ts-thinking-exploration-v3"
 THINKING_PREDICTION_SCHEMA_VERSION = "janus-ts-thinking-prediction-v2"
-THINKING_REQUEST_SCHEMA_VERSION = "janus-ts-thinking-request-v2"
+THINKING_REQUEST_SCHEMA_VERSION = "janus-ts-thinking-request-v3"
+THINKING_BATCH_PROGRESS_SCHEMA_VERSION = "janus-ts-thinking-batch-progress-v1"
 ARTIFACT_CLASS = "exploratory-non-formal"
 THINKING_PROMPT_SUFFIX = "<think>\n"
 DEFAULT_EXPLORATION_LIMIT = 2
@@ -669,6 +670,11 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -702,6 +708,54 @@ def write_exploration_fragment(
     return destination
 
 
+def _batch_persistence_payload() -> dict[str, Any]:
+    return {
+        "schema_version": THINKING_BATCH_PROGRESS_SCHEMA_VERSION,
+        "write_granularity": "one-generate-call",
+        "write_mode": "atomic-jsonl-and-fsync",
+        "seed_schedule": "base-seed-plus-global-batch-index-v1",
+    }
+
+
+def exploration_batch_path(
+    root: str | Path,
+    *,
+    rank: int,
+    batch_index: int,
+) -> Path:
+    if rank not in range(WORLD_SIZE):
+        raise ThinkingInferenceError(f"invalid exploratory rank {rank}")
+    if isinstance(batch_index, bool) or not isinstance(batch_index, int) or batch_index < 0:
+        raise ThinkingInferenceError(f"invalid exploratory batch index {batch_index!r}")
+    return (
+        Path(root)
+        / "batches"
+        / f"rank-{rank:05d}-of-{WORLD_SIZE:05d}"
+        / f"batch-{batch_index:06d}.jsonl"
+    )
+
+
+def write_exploration_batch(
+    root: str | Path,
+    *,
+    rank: int,
+    batch_index: int,
+    rows: Sequence[Mapping[str, Any]],
+) -> Path:
+    """Atomically persist one completed generate call without overwriting evidence."""
+
+    destination = exploration_batch_path(root, rank=rank, batch_index=batch_index)
+    payload = _jsonl_bytes(rows)
+    if destination.exists():
+        if destination.is_symlink() or not destination.is_file():
+            raise ThinkingInferenceError(f"invalid existing thinking batch: {destination}")
+        if destination.read_bytes() != payload:
+            raise ThinkingInferenceError(f"existing thinking batch differs: {destination}")
+        return destination
+    _atomic_write(destination, payload)
+    return destination
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -723,6 +777,72 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             )
         rows.append(value)
     return rows
+
+
+def _validate_prediction_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    rank: int,
+    request_sha256: str,
+    checkpoint_fingerprint: str,
+    sample_count: int,
+    expected_items: Sequence[ScheduledRecord] | None = None,
+) -> None:
+    expected_metadata = {
+        "schema_version": THINKING_PREDICTION_SCHEMA_VERSION,
+        "artifact_class": ARTIFACT_CLASS,
+        "formal_eligible": False,
+        "rank": rank,
+        "world_size": WORLD_SIZE,
+        "request_sha256": request_sha256,
+        "checkpoint_fingerprint": checkpoint_fingerprint,
+        "sample_count": sample_count,
+    }
+    for row in rows:
+        raw_responses = row.get("raw_responses")
+        if (
+            any(row.get(name) != value for name, value in expected_metadata.items())
+            or not isinstance(raw_responses, list)
+            or len(raw_responses) != sample_count
+            or any(not isinstance(response, str) for response in raw_responses)
+        ):
+            raise ThinkingInferenceError(
+                f"rank {rank} exploratory fragment has stale or formal-eligible metadata"
+            )
+    if expected_items is None:
+        return
+    expected_rows = tuple(item for item in expected_items if not item.is_dummy)
+    if [row.get("ordinal") for row in rows] != [item.ordinal for item in expected_rows] or [
+        row.get("reaction_id") for row in rows
+    ] != [item.record.reaction_id for item in expected_rows]:
+        raise ThinkingInferenceError(
+            f"rank {rank} persisted thinking batch has the wrong reaction identities"
+        )
+
+
+def _batch_inventory_paths(
+    root: Path,
+    request_payload: Mapping[str, Any],
+) -> tuple[Path, ...]:
+    persistence = request_payload.get("batch_persistence")
+    if persistence is None:
+        return ()
+    if persistence != _batch_persistence_payload():
+        raise ThinkingInferenceError("thinking batch persistence protocol mismatch")
+    call_count = request_payload.get("scheduled_generate_calls")
+    if (
+        isinstance(call_count, bool)
+        or not isinstance(call_count, int)
+        or call_count <= 0
+        or call_count % WORLD_SIZE
+    ):
+        raise ThinkingInferenceError("thinking request has an invalid generate-call count")
+    calls_per_rank = call_count // WORLD_SIZE
+    return tuple(
+        exploration_batch_path(root, rank=rank, batch_index=batch_index)
+        for rank in range(WORLD_SIZE)
+        for batch_index in range(calls_per_rank)
+    )
 
 
 def _inventory(paths: Sequence[Path], *, root: Path) -> dict[str, dict[str, Any]]:
@@ -749,29 +869,38 @@ def finalize_exploration_artifact(
     sample_count = int(request_payload["sample_count_per_reaction"])
     fragments = [exploration_fragment_path(destination, rank=rank) for rank in range(WORLD_SIZE)]
     rows: list[dict[str, Any]] = []
+    rows_by_rank: list[list[dict[str, Any]]] = []
     for rank, fragment in enumerate(fragments):
-        for row in _read_jsonl(fragment):
-            expected = {
-                "schema_version": THINKING_PREDICTION_SCHEMA_VERSION,
-                "artifact_class": ARTIFACT_CLASS,
-                "formal_eligible": False,
-                "rank": rank,
-                "world_size": WORLD_SIZE,
-                "request_sha256": request_sha256,
-                "checkpoint_fingerprint": checkpoint_fingerprint,
-                "sample_count": sample_count,
-            }
-            raw_responses = row.get("raw_responses")
-            if (
-                any(row.get(name) != value for name, value in expected.items())
-                or not isinstance(raw_responses, list)
-                or len(raw_responses) != sample_count
-                or any(not isinstance(response, str) for response in raw_responses)
-            ):
-                raise ThinkingInferenceError(
-                    f"rank {rank} exploratory fragment has stale or formal-eligible metadata"
+        rank_rows = _read_jsonl(fragment)
+        _validate_prediction_rows(
+            rank_rows,
+            rank=rank,
+            request_sha256=request_sha256,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            sample_count=sample_count,
+        )
+        rows_by_rank.append(rank_rows)
+        rows.extend(rank_rows)
+
+    batch_paths = _batch_inventory_paths(destination, request_payload)
+    if batch_paths:
+        calls_per_rank = len(batch_paths) // WORLD_SIZE
+        for rank in range(WORLD_SIZE):
+            persisted_rows = [
+                row
+                for batch_index in range(calls_per_rank)
+                for row in _read_jsonl(
+                    exploration_batch_path(
+                        destination,
+                        rank=rank,
+                        batch_index=batch_index,
+                    )
                 )
-            rows.append(row)
+            ]
+            if persisted_rows != rows_by_rank[rank]:
+                raise ThinkingInferenceError(
+                    f"rank {rank} final fragment differs from its persisted thinking batches"
+                )
     rows.sort(key=lambda row: int(row.get("ordinal", -1)))
     if [row.get("ordinal") for row in rows] != list(range(len(selected_ids))):
         raise ThinkingInferenceError("exploratory output ordinals are incomplete or duplicated")
@@ -780,7 +909,7 @@ def finalize_exploration_artifact(
 
     predictions = destination / "predictions.jsonl"
     _atomic_write(predictions, _jsonl_bytes(rows))
-    payload_paths = [*fragments, predictions]
+    payload_paths = [*batch_paths, *fragments, predictions]
     manifest = {
         **dict(request_payload),
         "schema_version": THINKING_EXPLORATION_SCHEMA_VERSION,
@@ -828,6 +957,10 @@ def validate_exploration_artifact(
         "rank-00001-of-00002.jsonl",
         "predictions.jsonl",
     }
+    expected_names.update(
+        path.relative_to(destination).as_posix()
+        for path in _batch_inventory_paths(destination, manifest)
+    )
     if not isinstance(inventory, Mapping) or set(inventory) != expected_names:
         raise ThinkingInferenceError("exploratory artifact has the wrong payload inventory")
     for relative, raw_entry in inventory.items():
@@ -1000,6 +1133,19 @@ def run_thinking_inference(
     return validate_exploration_artifact(run_root, request_sha256=request_sha256)
 
 
+def _seed_local_thinking_batch(torch_module: Any, *, seed: int) -> None:
+    """Give each persisted batch a restart-independent sampling stream."""
+
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ThinkingInferenceError(f"invalid thinking batch seed {seed!r}")
+    manual_seed = getattr(torch_module, "manual_seed", None)
+    if callable(manual_seed):
+        manual_seed(seed)
+    cuda = getattr(torch_module, "cuda", None)
+    if cuda is not None and cuda.is_available():
+        cuda.manual_seed_all(seed)
+
+
 def run_local_thinking_inference(
     config: ExperimentConfig,
     *,
@@ -1044,10 +1190,62 @@ def run_local_thinking_inference(
     execution = dict(request_payload["generation_execution"])
     execution["synced_gpus"] = False
     request_payload["generation_execution"] = execution
+    request_payload["batch_persistence"] = _batch_persistence_payload()
     run_root, request_sha256 = exploration_run_path(output_dir, request_payload)
     if (run_root / ".complete").is_file():
         return validate_exploration_artifact(run_root, request_sha256=request_sha256)
     run_root.mkdir(parents=True, exist_ok=True)
+
+    scheduled = schedule_equal_rank_calls(selected)
+    per_rank = len(scheduled) // WORLD_SIZE
+    sample_count = int(request_payload["sample_count_per_reaction"])
+    calls_per_rank = (per_rank + reaction_batch_size - 1) // reaction_batch_size
+    persisted_batches: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    missing_batch_seen = False
+    for logical_rank in range(WORLD_SIZE):
+        start = logical_rank * per_rank
+        rank_items = scheduled[start : start + per_rank]
+        for batch_index, batch_start in enumerate(range(0, len(rank_items), reaction_batch_size)):
+            items = rank_items[batch_start : batch_start + reaction_batch_size]
+            path = exploration_batch_path(
+                run_root,
+                rank=logical_rank,
+                batch_index=batch_index,
+            )
+            if path.exists() or path.is_symlink():
+                if missing_batch_seen:
+                    raise ThinkingInferenceError(
+                        "persisted thinking batches are not one contiguous prefix"
+                    )
+                if path.is_symlink() or not path.is_file():
+                    raise ThinkingInferenceError(f"invalid persisted thinking batch: {path}")
+                rows = _read_jsonl(path)
+                _validate_prediction_rows(
+                    rows,
+                    rank=logical_rank,
+                    request_sha256=request_sha256,
+                    checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+                    sample_count=sample_count,
+                    expected_items=items,
+                )
+                persisted_batches[(logical_rank, batch_index)] = rows
+            else:
+                missing_batch_seen = True
+
+    if len(persisted_batches) == calls_per_rank * WORLD_SIZE:
+        for logical_rank in range(WORLD_SIZE):
+            rows = [
+                row
+                for batch_index in range(calls_per_rank)
+                for row in persisted_batches[(logical_rank, batch_index)]
+            ]
+            write_exploration_fragment(run_root, rank=logical_rank, rows=rows)
+        print(f"[thinking:{split}] {len(scheduled)}/{len(scheduled)} recovered", flush=True)
+        return finalize_exploration_artifact(
+            run_root,
+            request_payload,
+            request_sha256=request_sha256,
+        )
 
     if torch_module is None:
         import torch as torch_module
@@ -1061,63 +1259,75 @@ def run_local_thinking_inference(
     )
     tokenizer = tokenizer_loader(config, local_files_only=local_files_only)
 
-    scheduled = schedule_equal_rank_calls(selected)
-    per_rank = len(scheduled) // WORLD_SIZE
     completed_records = 0
-    sample_count = int(request_payload["sample_count_per_reaction"])
     for logical_rank in range(WORLD_SIZE):
-        reproducibility_configurer(torch_module, seed=config.seed, cuda_device=0)
-        if torch_module.cuda.is_available():
-            torch_module.cuda.manual_seed_all(config.seed)
         rows: list[dict[str, Any]] = []
         start = logical_rank * per_rank
         stop = start + per_rank
         rank_items = scheduled[start:stop]
-        for batch_start in range(0, len(rank_items), reaction_batch_size):
+        for batch_index, batch_start in enumerate(range(0, len(rank_items), reaction_batch_size)):
             items = rank_items[batch_start : batch_start + reaction_batch_size]
-            if len(items) == 1:
-                predictions = (
-                    generator(
+            persisted = persisted_batches.get((logical_rank, batch_index))
+            if persisted is not None:
+                batch_rows = persisted
+            else:
+                global_batch_index = logical_rank * calls_per_rank + batch_index
+                _seed_local_thinking_batch(
+                    torch_module,
+                    seed=config.seed + global_batch_index,
+                )
+                if len(items) == 1:
+                    predictions = (
+                        generator(
+                            model,
+                            tokenizer,
+                            items[0].record,
+                            ordinal=items[0].ordinal,
+                            profile=config.thinking_generation,
+                            sample_count=sample_count,
+                            max_input_length=config.model.max_sequence_length,
+                            synchronized=False,
+                        ),
+                    )
+                else:
+                    predictions = batch_generator(
                         model,
                         tokenizer,
-                        items[0].record,
-                        ordinal=items[0].ordinal,
+                        tuple(item.record for item in items),
+                        ordinals=tuple(item.ordinal for item in items),
                         profile=config.thinking_generation,
                         sample_count=sample_count,
                         max_input_length=config.model.max_sequence_length,
                         synchronized=False,
-                    ),
-                )
-            else:
-                predictions = batch_generator(
-                    model,
-                    tokenizer,
-                    tuple(item.record for item in items),
-                    ordinals=tuple(item.ordinal for item in items),
-                    profile=config.thinking_generation,
-                    sample_count=sample_count,
-                    max_input_length=config.model.max_sequence_length,
-                    synchronized=False,
-                )
-            if len(predictions) != len(items):
-                raise ThinkingInferenceError(
-                    "thinking batch generator returned the wrong number of predictions"
-                )
-            for item, prediction in zip(items, predictions, strict=True):
-                if len(prediction.raw_responses) != sample_count:
+                    )
+                if len(predictions) != len(items):
                     raise ThinkingInferenceError(
-                        f"{item.record.reaction_id}: generator returned "
-                        f"{len(prediction.raw_responses)} responses, expected {sample_count}"
+                        "thinking batch generator returned the wrong number of predictions"
                     )
-                if not item.is_dummy:
-                    rows.append(
-                        prediction.to_json_dict(
-                            split=split,
-                            rank=logical_rank,
-                            request_sha256=request_sha256,
-                            checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+                batch_rows = []
+                for item, prediction in zip(items, predictions, strict=True):
+                    if len(prediction.raw_responses) != sample_count:
+                        raise ThinkingInferenceError(
+                            f"{item.record.reaction_id}: generator returned "
+                            f"{len(prediction.raw_responses)} responses, expected {sample_count}"
                         )
-                    )
+                    if not item.is_dummy:
+                        batch_rows.append(
+                            prediction.to_json_dict(
+                                split=split,
+                                rank=logical_rank,
+                                request_sha256=request_sha256,
+                                checkpoint_fingerprint=checkpoint.checkpoint_fingerprint,
+                            )
+                        )
+                write_exploration_batch(
+                    run_root,
+                    rank=logical_rank,
+                    batch_index=batch_index,
+                    rows=batch_rows,
+                )
+                persisted_batches[(logical_rank, batch_index)] = batch_rows
+            rows.extend(batch_rows)
             completed_records += len(items)
             if completed_records % progress_interval == 0 or completed_records == len(scheduled):
                 print(

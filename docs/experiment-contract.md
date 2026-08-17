@@ -210,18 +210,19 @@ PiSSA or LoRA. Both non-thinking modes use the identical `MoleCode-TS/v1`
 prompt, beam 10, 512-token limit, strict parser, and
 @1/@2/@3/@4/@5/@10 metrics. Both thinking modes use the separately frozen
 sampling profile (`beam=1`, `temperature=0.6`, `top_p=0.95`, `top_k=20`,
-`max_new_tokens=8192`). Complete-test evaluation requests ten independently
-sampled candidates per reaction in one generation call and reports
-@1/@2/@3/@4/@5/@10 with the same independent per-metric oracle rule as
-non-thinking. Every raw reasoning trace is retained; only the final answer
-after exactly one `</think>` marker is parsed. A missing, repeated, or
-unterminated thinking boundary makes that candidate invalid.
+`max_new_tokens=8192`). Complete-test evaluation requests one sampled
+candidate per reaction and reports @1. Every raw reasoning trace is retained;
+only the final answer after exactly one `</think>` marker is parsed. A missing,
+repeated, or unterminated thinking boundary makes that candidate invalid.
 
-The YAML value `thinking_generation.num_return_sequences=1` remains the base
-subset-exploration profile so the already-running training identity is
-unchanged. The complete-test request records an explicit
-`sample_count_per_reaction=10` override in its content-addressed manifest and
-forwards `num_return_sequences=10` to Transformers.
+The YAML value `thinking_generation.num_return_sequences=1` applies to both
+subset exploration and complete-test evaluation, so the training identity is
+unchanged. Complete-test thinking uses pinned vLLM 0.25.1 in BF16 with pipeline
+parallelism across both GPUs and eight concurrent requests. Its manifest records
+the engine, converted LoRA digest, and `sample_count_per_reaction=1`. Each vLLM
+request is atomically persisted and validated; recovery skips the verified
+contiguous prefix and resumes at the first missing request. The optional subset
+exploration remains on the existing Transformers path.
 
 Thinking artifacts are supplemental (`formal_eligible=false`), do not acquire
 the formal test lease, and cannot affect checkpoint selection. The final

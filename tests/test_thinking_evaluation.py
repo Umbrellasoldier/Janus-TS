@@ -52,13 +52,13 @@ def _raw_receipt(tmp_path: Path) -> ThinkingExplorationReceipt:
             "ordinal": 0,
             "reaction_id": "rxn0001",
             "sample_count": THINKING_TEST_SAMPLE_COUNT,
-            "raw_responses": [correct, *(["unfinished reasoning"] * 9)],
+            "raw_responses": [correct],
         },
         {
             "ordinal": 1,
             "reaction_id": "rxn0002",
             "sample_count": THINKING_TEST_SAMPLE_COUNT,
-            "raw_responses": ["unfinished reasoning", correct, *(["unfinished reasoning"] * 8)],
+            "raw_responses": ["unfinished reasoning"],
         },
     ]
     (root / "predictions.jsonl").write_text(
@@ -83,7 +83,7 @@ def test_extract_thinking_answer_requires_one_closed_reasoning_block() -> None:
     assert extract_thinking_answer("a</think>b</think>c")[1] == "multiple_closing_think"
 
 
-def test_thinking_scores_use_only_final_answers_and_report_all_k(tmp_path: Path) -> None:
+def test_thinking_scores_use_only_final_answers_and_report_at1(tmp_path: Path) -> None:
     config = _small_config()
     binding = ThinkingModelBinding(
         role="zero-shot",
@@ -105,20 +105,11 @@ def test_thinking_scores_use_only_final_answers_and_report_all_k(tmp_path: Path)
     metrics = json.loads((root / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["sample_count_per_reaction"] == THINKING_TEST_SAMPLE_COUNT
     assert metrics["report_k"] == list(THINKING_TEST_REPORT_K)
-    assert set(metrics["evaluation"]["metrics"]) == {
-        "@1",
-        "@2",
-        "@3",
-        "@4",
-        "@5",
-        "@10",
-    }
+    assert set(metrics["evaluation"]["metrics"]) == {"@1"}
     assert metrics["evaluation"]["metrics"]["@1"]["count"] == 2
     assert metrics["evaluation"]["metrics"]["@1"]["exact"]["successes"] == 1
-    assert metrics["evaluation"]["metrics"]["@2"]["exact"]["successes"] == 2
-    assert metrics["evaluation"]["metrics"]["@10"]["exact"]["successes"] == 2
-    assert metrics["extraction_errors"] == {"missing_closing_think": 18}
-    assert metrics["parse_valid_candidate_count"] == 2
+    assert metrics["extraction_errors"] == {"missing_closing_think": 1}
+    assert metrics["parse_valid_candidate_count"] == 1
 
 
 def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Path) -> None:
@@ -133,7 +124,7 @@ def test_zero_shot_binding_and_runtime_receipt_are_content_verified(tmp_path: Pa
     )
     raw = _raw_receipt(tmp_path)
     raw_manifest = {
-        "schema_version": "janus-ts-thinking-exploration-v2",
+        "schema_version": "janus-ts-thinking-exploration-v3",
         "artifact_class": "exploratory-non-formal",
         "formal_eligible": False,
         "affects_checkpoint_selection": False,
