@@ -8,6 +8,30 @@ representation. Raw chemistry datasets and the historical `chemformer_bo`
 checkout are read-only inputs; generated data and run artifacts live below
 `artifacts/` and are intentionally excluded from Git.
 
+## Default inference and main result
+
+The project default is the selected fine-tuned checkpoint in **non-thinking**
+mode. It uses deterministic beam search with `num_beams=10`, returns 10
+candidates, allows at most 512 new tokens, and reports
+`@1/@2/@3/@4/@5/@10`. This is the `generation` profile in
+`configs/transition1x.yaml`; thinking is an optional supplemental mode rather
+than the default.
+
+The primary experimental result is the
+[Transition1x fine-tuned non-thinking test report](docs/transition1x-finetuned-nonthinking-test-results.md).
+It evaluates the selected epoch-5 checkpoint on all 996 held-out test
+reactions. Each metric independently uses its best candidate among the first
+*k* beams.
+
+| k | Connectivity | Exact | edit bond ↓ | Edge IoU ↑ | Edge F1 ↑ |
+|---:|---:|---:|---:|---:|---:|
+| @1 | 60.9438% | 47.3896% | 1.3353 | 0.9574 | 0.9769 |
+| @10 | **84.3373%** | **74.1968%** | **0.5141** | **0.9851** | **0.9920** |
+
+Connectivity requires the complete edge set to match while ignoring bond
+order. Exact additionally requires every bond order to match; a wrong bond
+order counts as one edit.
+
 ## Commands
 
 ```bash
@@ -40,10 +64,11 @@ locked, only that fine-tuned checkpoint is used for the complete
 non-thinking, selected-checkpoint thinking, raw-Qwen non-thinking, raw-Qwen
 thinking.
 Non-thinking uses deterministic beam 10 and reports @1/@2/@3/@4/@5/@10.
-Each complete-test thinking call returns ten independently sampled candidates
-in one batch, retains every raw reasoning trace, and scores the answers after
-`</think>` at @1/@2/@3/@4/@5/@10. Thinking remains ineligible for checkpoint
-selection. The final artifact compares all four modes.
+Each complete-test thinking call returns one sampled candidate through pinned
+vLLM 0.25.1 with eight concurrent requests. Every completed request is saved
+atomically, and the answer after `</think>` is scored at @1.
+Thinking remains ineligible for checkpoint selection. The final artifact
+compares all four modes.
 Checkpoint and stage ordering use fingerprints, explicit global steps, and
 completion markers only—never filesystem modification time. Trainer events
 are appended and fsynced to the run's `logs/train.jsonl` every configured ten
@@ -78,10 +103,10 @@ written as a prediction.
 
 The frozen exploratory profile enables thinking and sampling with beam 1,
 temperature 0.6, top-p 0.95, top-k 20, min-p 0, repetition penalty 1, and up
-to 8192 new tokens. The subset CLI retains its configured one-sample default;
-the automatic complete-test runner records and applies a ten-sample evaluation
-override without changing the training run identity. `presence_penalty=0` is
-recorded in provenance only and is not passed to Transformers. Results are content-addressed below
-`OUTPUT_DIR/thinking-exploratory/` and are marked `formal_eligible=false`.
+to 8192 new tokens. Both the optional Transformers subset CLI and the automatic
+vLLM complete-test runner use one sample per reaction. `presence_penalty=0` is
+recorded but omitted only by the Transformers subset path; vLLM receives it
+explicitly. Results are content-addressed below `OUTPUT_DIR/thinking-exploratory/`
+and are marked `formal_eligible=false`.
 They do not compute formal metrics, alter checkpoint selection or run state,
 or acquire the one-time formal test lease.

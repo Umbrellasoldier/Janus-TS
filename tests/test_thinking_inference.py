@@ -321,7 +321,7 @@ def test_local_thinking_uses_two_reaction_batches_only_for_test(
 ) -> None:
     config = load_config("configs/transition1x.yaml")
     checkpoint = _checkpoint(tmp_path)
-    records = tuple(_record(f"rxn{index:04d}", split="test") for index in range(3))
+    records = tuple(_record(f"rxn{index:04d}", split="test") for index in range(4))
     batch_sizes: list[int] = []
 
     def batch_generator(
@@ -354,7 +354,7 @@ def test_local_thinking_uses_two_reaction_batches_only_for_test(
         checkpoint_dir=checkpoint.path,
         output_dir=tmp_path / "output",
         split="test",
-        limit=3,
+        limit=4,
         sample_count_per_reaction=1,
         environment_installer=lambda: None,
         reproducibility_configurer=lambda *_args, **_kwargs: None,
@@ -371,9 +371,117 @@ def test_local_thinking_uses_two_reaction_batches_only_for_test(
     )
 
     assert batch_sizes == [2, 2]
-    assert receipt.payload["selection_count"] == 3
+    assert receipt.payload["selection_count"] == 4
     assert receipt.payload["scheduled_generate_calls"] == 2
     assert receipt.payload["generation_execution"]["reaction_batch_size"] == 2
+
+
+def test_local_thinking_persists_each_batch_and_resumes_verified_prefix(
+    tmp_path: Path,
+) -> None:
+    config = load_config("configs/transition1x.yaml")
+    checkpoint = _checkpoint(tmp_path)
+    records = tuple(_record(f"rxn{index:04d}", split="test") for index in range(8))
+    first_calls: list[tuple[str, ...]] = []
+    first_seeds: list[int] = []
+
+    def predictions(
+        batch_records: tuple[ReactionRecord, ...],
+        ordinals: tuple[int, ...],
+    ) -> tuple[ThinkingPrediction, ...]:
+        return tuple(
+            ThinkingPrediction(
+                reaction_id=record.reaction_id,
+                ordinal=ordinal,
+                atom_count=record.atom_count,
+                prompt_sha256="e" * 64,
+                prompt_tokens=10,
+                raw_responses=(f"response-{record.reaction_id}",),
+            )
+            for record, ordinal in zip(batch_records, ordinals, strict=True)
+        )
+
+    def interrupted_generator(
+        _model: Any,
+        _tokenizer: Any,
+        batch_records: tuple[ReactionRecord, ...],
+        *,
+        ordinals: tuple[int, ...],
+        **_kwargs: Any,
+    ) -> tuple[ThinkingPrediction, ...]:
+        first_calls.append(tuple(record.reaction_id for record in batch_records))
+        if len(first_calls) == 3:
+            raise RuntimeError("simulated interruption")
+        return predictions(batch_records, ordinals)
+
+    first_torch = SimpleNamespace(
+        manual_seed=first_seeds.append,
+        cuda=SimpleNamespace(is_available=lambda: False),
+    )
+    common = {
+        "processed_path": tmp_path / "processed",
+        "checkpoint_dir": checkpoint.path,
+        "output_dir": tmp_path / "output",
+        "split": "test",
+        "limit": 8,
+        "sample_count_per_reaction": 1,
+        "environment_installer": lambda: None,
+        "reproducibility_configurer": lambda *_args, **_kwargs: None,
+        "checkpoint_inspector": lambda *_args, **_kwargs: checkpoint,
+        "record_loader": lambda *_args, **_kwargs: records,
+        "model_loader": lambda *_args, **_kwargs: object(),
+        "tokenizer_loader": lambda *_args, **_kwargs: object(),
+        "generator": lambda *_args, **_kwargs: pytest.fail(
+            "even test batches must not use the single-record generator"
+        ),
+        "progress_interval": 10,
+    }
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_local_thinking_inference(
+            config,
+            batch_generator=interrupted_generator,
+            torch_module=first_torch,
+            **common,
+        )
+
+    roots = list((tmp_path / "output").glob("thinking-exploratory/*/test/*"))
+    assert len(roots) == 1
+    assert len(list(roots[0].glob("batches/rank-*/*.jsonl"))) == 2
+    assert not (roots[0] / ".complete").exists()
+    assert first_seeds == [42, 43, 44]
+
+    resumed_calls: list[tuple[str, ...]] = []
+    resumed_seeds: list[int] = []
+
+    def resumed_generator(
+        _model: Any,
+        _tokenizer: Any,
+        batch_records: tuple[ReactionRecord, ...],
+        *,
+        ordinals: tuple[int, ...],
+        **_kwargs: Any,
+    ) -> tuple[ThinkingPrediction, ...]:
+        resumed_calls.append(tuple(record.reaction_id for record in batch_records))
+        return predictions(batch_records, ordinals)
+
+    receipt = run_local_thinking_inference(
+        config,
+        batch_generator=resumed_generator,
+        torch_module=SimpleNamespace(
+            manual_seed=resumed_seeds.append,
+            cuda=SimpleNamespace(is_available=lambda: False),
+        ),
+        **common,
+    )
+
+    assert resumed_calls == [
+        ("rxn0004", "rxn0005"),
+        ("rxn0006", "rxn0007"),
+    ]
+    assert resumed_seeds == [44, 45]
+    assert len(list(receipt.path.glob("batches/rank-*/*.jsonl"))) == 4
+    assert len(receipt.payload["payload_inventory"]) == 7
+    assert (receipt.path / ".complete").is_file()
 
 
 def test_exploration_manifest_is_content_verified_and_formally_ineligible(
